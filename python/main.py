@@ -62,16 +62,16 @@ if __name__ == "__main__":
 
     f = open(os.path.join(args.dataset_path, "calibration.json"))
     raw_calibration = json.load(f)['value0']
-    calibrations = parse_json_calib(raw_calibration, args.matching_resolution, args.device)
+    cam_models = parse_json_calib(raw_calibration, args.matching_resolution, args.device)
 
     # Reference viewpoint for the estimated RGB-D panorama is the center of the references
     reprojection_viewpoint = torch.zeros([3], device=args.device)
     for references_index in args.references_indices:
-        reprojection_viewpoint += calibrations[references_index].rt[:3, 3] / len(args.references_indices)
+        reprojection_viewpoint += cam_models[references_index].rt[:3, 3] / len(args.references_indices)
 
     # Read masks
     masks = []
-    for cam_index in range(len(calibrations)):
+    for cam_index in range(len(cam_models)):
         if os.path.isfile(os.path.join(args.dataset_path, "cam" + str(cam_index)) + "/" + "mask.png"):
             mask = cv2.imread(os.path.join(args.dataset_path, "cam" + str(cam_index)) + "/" + "mask.png", 
                               cv2.IMREAD_UNCHANGED)
@@ -81,7 +81,7 @@ if __name__ == "__main__":
             masks.append(torch.ones(args.matching_resolution, device=args.device).unsqueeze(0))
 
     # Initialize distance estimator and stitcher
-    rgbd_estimator = RGBD_Estimator(calibrations, args.min_dist, args.max_dist, args.candidate_count, 
+    rgbd_estimator = RGBD_Estimator(cam_models, args.min_dist, args.max_dist, args.candidate_count, 
                                     args.references_indices, reprojection_viewpoint, masks, 
                                     args.matching_resolution, args.rgb_to_stitch_resolution, args.panorama_resolution, 
                                     args.sigma_i, args.sigma_s, args.device)
@@ -96,7 +96,7 @@ if __name__ == "__main__":
     all_fisheye_images = Parallel(n_jobs=-1, backend="threading")(
         delayed(read_input_images)(
             filename, args.dataset_path, args.matching_resolution, args.rgb_to_stitch_resolution, 
-            calibrations, args.references_indices) 
+            cam_models, args.references_indices) 
         for filename in filenames)
 
     rgbd_panoramas = {}

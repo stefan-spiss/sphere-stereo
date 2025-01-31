@@ -29,15 +29,34 @@ Please refer to license.txt for more details.
 =======================================================================
 """
 import math
+import os.path
+import warnings
+from abc import ABC, abstractmethod
+
+import cv2
+import numpy as np
 import torch
 from scipy.spatial.transform import Rotation as R
-import cv2 
-import os.path 
-import warnings
-import numpy as np
-from skimage.metrics import structural_similarity, peak_signal_noise_ratio
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
-class Calibration:
+
+class CamModel(ABC):
+    def __init__(self, device='cpu'):
+        self.id: int = -1
+        self.model: str = ''
+        self.original_resolution: tuple[int, int] = (0, 0)
+        self.rt = torch.eye(4, device=device)
+        self.matching_scale: torch.Tensor = torch.Tensor(1.0, 1.0).to(device)
+
+    @abstractmethod
+    def unproject(self, uv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pass
+
+    @abstractmethod
+    def project(self, point: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pass
+
+class DoubleSphereModel(CamModel):
     def __init__(self, original_resolution, principal, fl, xi, alpha, rt, matching_scale):
         """
         Args:
@@ -46,6 +65,7 @@ class Calibration:
             matching_scale: [2] Scale to apply to the resolution, principal and fl 
                 when working with images resized to the matching resolution
         """
+        super().__init__(rt.device)
         self.original_resolution = original_resolution
         self.principal = principal
         self.fl = fl
@@ -54,55 +74,54 @@ class Calibration:
         self.rt = rt
         self.matching_scale = matching_scale 
 
-def unproject(uv,  calib):
-    """
-    Unproject pixels to the unit sphere following the The Double Sphere Camera Model (https://arxiv.org/abs/1807.08957)
-    Apply the calib.matching_scale to fit the distance estimation resolution
-    """
-    m_xy = (uv - calib.principal * calib.matching_scale) / (calib.fl * calib.matching_scale)
+    def unproject(self, uv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Unproject pixels to the unit sphere following the The Double Sphere Camera Model (https://arxiv.org/abs/1807.08957)
+        Apply the self.matching_scale to fit the distance estimation resolution
+        """
+        m_xy = (uv - self.principal * self.matching_scale) / (self.fl * self.matching_scale)
 
-    r2 = torch.sum(m_xy**2, dim=-1, keepdim=True)
-    m_z = ((1 - calib.alpha**2 * r2) 
-           / (calib.alpha * torch.sqrt(torch.clamp(1 - (2 * calib.alpha - 1) * r2, min=0)) + 1 - calib.alpha))
+        r2 = torch.sum(m_xy**2, dim=-1, keepdim=True)
+        m_z = ((1 - self.alpha**2 * r2) 
+               / (self.alpha * torch.sqrt(torch.clamp(1 - (2 * self.alpha - 1) * r2, min=0)) + 1 - self.alpha))
 
-    point = torch.cat([m_xy, m_z], dim=-1)
-    point = ((m_z * calib.xi + torch.sqrt(m_z**2 + (1 - calib.xi**2) * r2)) / (m_z**2 + r2)) * point
-    point[..., 2] -= calib.xi
+        point = torch.cat([m_xy, m_z], dim=-1)
+        point = ((m_z * self.xi + torch.sqrt(m_z**2 + (1 - self.xi**2) * r2)) / (m_z**2 + r2)) * point
+        point[..., 2] -= self.xi
 
-    valid = (1 - (2 * calib.alpha - 1) * r2 >= 0)
-    return point, valid[..., 0]
-
-def project(point, calib):
-    """
-    Project a point in space to pixel coordinates (https://arxiv.org/abs/1807.08957)
-    Apply the calib.matching_scale to fit the distance estimation resolution
-    """
-    d1 = torch.norm(point, dim=-1, keepdim=True)
-
-    c = calib.xi * d1 + point[..., 2:3]
-    d2 = torch.norm(torch.cat([point[..., :2], c], dim=-1), dim=-1, keepdim=True)
-    norm = calib.alpha * d2 + (1 - calib.alpha) * c
+        valid = (1 - (2 * self.alpha - 1) * r2 >= 0)
+        return point, valid[..., 0]
     
-    if(calib.alpha > 0.5):
-        w1 = (1 - calib.alpha) / calib.alpha 
-    else: 
-        w1 = calib.alpha / (1 - calib.alpha)
-    w2 = (w1 + calib.xi) / math.sqrt(2 * w1 * calib.xi + calib.xi**2 + 1)
+    def project(self, point: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Project a point in space to pixel coordinates (https://arxiv.org/abs/1807.08957)
+        Apply the self.matching_scale to fit the distance estimation resolution
+        """
+        d1 = torch.norm(point, dim=-1, keepdim=True)
 
-    valid = point[..., 2:3] > - w2 * d1
-    uv = (calib.fl * calib.matching_scale * point[..., :2]) / norm + calib.principal * calib.matching_scale
-    return uv, valid[..., 0]
+        c = self.xi * d1 + point[..., 2:3]
+        d2 = torch.norm(torch.cat([point[..., :2], c], dim=-1), dim=-1, keepdim=True)
+        norm = self.alpha * d2 + (1 - self.alpha) * c
+        
+        w1 = (1 - self.alpha) / self.alpha if self.alpha > 0.5 else self.alpha / (1 - self.alpha)
+        w2 = (w1 + self.xi) / math.sqrt(2 * w1 * self.xi + self.xi**2 + 1)
 
-def parse_json_calib(raw_calibration, matching_resolution, device):
+        valid = point[..., 2:3] > - w2 * d1
+        uv = (self.fl * self.matching_scale * point[..., :2]) / norm + self.principal * self.matching_scale
+        return uv, valid[..., 0]
+
+
+
+def parse_json_calib(raw_calibration, matching_resolution, device)->list[CamModel]:
     """
     Parse basalt-formated calibration file (https://gitlab.com/VladyslavUsenko/basalt/-/blob/master/doc/Calibration.md)
     Args:
         matching_resolution: [2] Resolution at which the fisheye images will be resize for distance estimation.
             It is used to obtain the matching_scale component of the calibration.
     """
-    calibrations = []
+    cam_models = []
     for extrinsics, intrinsics, original_resolution \
-            in zip(raw_calibration['T_imu_cam'], raw_calibration['intrinsics'], raw_calibration['resolution']):
+            in zip(raw_calibration['T_imu_cam'], raw_calibration['intrinsics'], raw_calibration['resolution'], strict=True):
         
         if(intrinsics["camera_type"] != "ds"):
             raise Exception("Unexpected camera model. The current implementation only support double sphere.")
@@ -126,7 +145,7 @@ def parse_json_calib(raw_calibration, matching_resolution, device):
         rt[:3, :3] = torch.tensor(r.as_matrix(), device=device)
         rt[:3, 3] = t
 
-        calibrations.append(Calibration(
+        cam_models.append(DoubleSphereModel(
             original_resolution,
             torch.tensor([cam_intrinsics['cx'], cam_intrinsics['cy']], device=device),
             torch.tensor([cam_intrinsics['fx'], cam_intrinsics['fy']], device=device),
@@ -139,7 +158,7 @@ def parse_json_calib(raw_calibration, matching_resolution, device):
                 ], device=device)
         ))
 
-    return calibrations
+    return cam_models
 
 def rgb2yCbCr(rgb):
     rgb = rgb.float()
@@ -155,7 +174,7 @@ def rgb2yCbCr(rgb):
     return yuv
 
 def read_input_images(filename, dataset_path, matching_resolution, rgb_to_stitch_resolution, 
-                      calibrations, references_indices):
+                      cam_models, references_indices):
     """
     Read and resize fisheye images 
     """
@@ -163,13 +182,13 @@ def read_input_images(filename, dataset_path, matching_resolution, rgb_to_stitch
     images_to_stitch = []
     valid_frame = True
     # Read input image for each camera
-    for cam_index, calibration in enumerate(calibrations):
+    for cam_index, cam_model in enumerate(cam_models):
         file_path = os.path.join(dataset_path, "cam" + str(cam_index)) + "/" + filename
         image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
         
         # Type and innapropriate file handling
         if image is not None:
-            if image.shape == (calibration.original_resolution[1], calibration.original_resolution[0], 3):
+            if image.shape == (cam_model.original_resolution[1], cam_model.original_resolution[0], 3):
                 # Map all types range to [0, 255] as float32
                 if image.dtype == np.uint8:
                     image = image.astype(np.float32)

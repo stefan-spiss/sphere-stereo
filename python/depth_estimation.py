@@ -32,17 +32,17 @@ Please refer to license.txt for more details.
 
 from isb_filter import ISB_Filter
 from stitcher import Stitcher
-from utils import project, unproject, rgb2yCbCr
+from utils import rgb2yCbCr
 import torch
 
 class RGBD_Estimator:
-    def __init__(self, calibrations, min_dist, max_dist, candidate_count, references_indices, reprojection_viewpoint, 
+    def __init__(self, cam_models, min_dist, max_dist, candidate_count, references_indices, reprojection_viewpoint, 
                  masks, matching_resolution, rgb_to_stitch_resolution, panorama_resolution, sigma_i, sigma_s, device):
         """
         Prepare RGB-D estimation from fisheye images. 
         Perform camera selection for adaptive matching, initialize filters and stitcher 
         Args:
-            calibrations: [number of cameras] calibration parameters following the double sphere model for each camera
+            cam_models: [number of cameras] calibration parameters following the double sphere model for each camera
             min_dist, max_dist: minimum and maximum distance for the sphere sweep volume computation
             candidate_count: Number of distance candidates between min_dist and max_dist (included)
             references_indices: [number of references] Indices of the cameras where distance estimation is performed before stitching 
@@ -58,7 +58,7 @@ class RGBD_Estimator:
             sigma_s: Smoothing parameter. Higher values give more weight to coarser scales during filtering
             device: CUDA-enabled GPU used for processing
         """
-        self.calibrations = calibrations
+        self.cam_models = cam_models
         self.min_dist = min_dist
         self.max_dist = max_dist
         self.candidate_count = candidate_count
@@ -72,7 +72,7 @@ class RGBD_Estimator:
         self.cost_filter = ISB_Filter(candidate_count, matching_resolution, device)
         self.distance_filter = ISB_Filter(1, matching_resolution, device)
 
-        calibrations_for_stitch = [calibrations[reference_index] for reference_index in references_indices]
+        calibrations_for_stitch = [cam_models[reference_index] for reference_index in references_indices]
         masks_for_stitching = [masks[reference_index] for reference_index in references_indices]
         self.fishey_stitcher = Stitcher(calibrations_for_stitch, reprojection_viewpoint, 
                                         masks_for_stitching, min_dist, max_dist, 
@@ -86,29 +86,28 @@ class RGBD_Estimator:
         """
         self.selected_cameras = []
         for reference_index in self.references_indices:
-            reference_calibration = self.calibrations[reference_index]
+            reference_cam_model = self.cam_models[reference_index]
             selected_camera = -torch.ones(self.matching_resolution[::-1], dtype=int, device=self.device).unsqueeze(0)
             max_displacement = torch.ones(self.matching_resolution[::-1], device=self.device).unsqueeze(0)
 
             u, v = torch.meshgrid([torch.arange(0, self.matching_resolution[1], device=self.device), 
                 torch.arange(0, self.matching_resolution[0], device=self.device)])
-            pt_unit, reference_valid = unproject(torch.stack([v, u], dim=-1).unsqueeze(0), 
-                                                 reference_calibration)
+            pt_unit, reference_valid = reference_cam_model.unproject(torch.stack([v, u], dim=-1).unsqueeze(0))
 
             # Go through all the matched cameras and select the best one per pixel
-            for cam_index, (calibration, mask) in enumerate(zip(self.calibrations, masks)):
+            for cam_index, (cam_model, mask) in enumerate(zip(self.cam_models, masks, strict=True)):
                 pt_near = pt_unit * self.min_dist
                 pt_far = pt_unit * self.max_dist
 
                 # points in the matched camera's point of view
-                rt = torch.matmul(torch.inverse(calibration.rt), reference_calibration.rt)
+                rt = torch.matmul(torch.inverse(cam_model.rt), reference_cam_model.rt)
                 pt_near = torch.matmul(torch.cat([pt_near, torch.ones_like(pt_near[..., :1])], dim=-1), rt.T)
                 pt_far = torch.matmul(torch.cat([pt_far, torch.ones_like(pt_near[..., :1])], dim=-1), rt.T)
                 pt_near = pt_near[..., :3] / torch.norm(pt_near[..., :3], dim=-1, keepdim=True)
                 pt_far = pt_far[..., :3] / torch.norm(pt_far[..., :3], dim=-1, keepdim=True)
 
-                uv_near, valid_near = project(pt_near, calibration)
-                uv_far, valid_far = project(pt_far, calibration)  
+                uv_near, valid_near = cam_model.project(pt_near)
+                uv_far, valid_far = cam_model.project(pt_far)  
 
                 # Evaluate the displacement from a given change in distance
                 displacement = torch.norm(uv_near - uv_far, dim=-1)
@@ -134,13 +133,13 @@ class RGBD_Estimator:
     
             self.selected_cameras.append(selected_camera)
 
-    def estimate_fisheye_distance(self, reference_image, guide, reference_calibration, selected_camera, images):
+    def estimate_fisheye_distance(self, reference_image, guide, reference_cam_model, selected_camera, images):
         """
         Estimate distance on a fisheye image using the images from the other cameras
         """
         u, v = torch.meshgrid([torch.arange(0, self.matching_resolution[1], device=self.device), 
                                torch.arange(0, self.matching_resolution[0], device=self.device)])
-        pt_unit, _ = unproject(torch.stack([v, u], dim=-1).unsqueeze(0), reference_calibration)
+        pt_unit, _ = reference_cam_model.unproject(torch.stack([v, u], dim=-1).unsqueeze(0))
         
         distance_candidates = 1 / torch.linspace(1 / self.min_dist, 1 / self.max_dist, 
                                                self.candidate_count, device=self.device)
@@ -152,11 +151,11 @@ class RGBD_Estimator:
             device=self.device)
 
         # Sweeping volume computation, with a different camera for each pixel following adaptive spherical matching 
-        for cam_index, calibration in enumerate(self.calibrations):
-            rt = torch.matmul(torch.inverse(calibration.rt), reference_calibration.rt)
+        for cam_index, cam_model in enumerate(self.cam_models):
+            rt = torch.matmul(torch.inverse(cam_model.rt), reference_cam_model.rt)
             point_volume_in_cam = torch.matmul(torch.cat([point_volume, torch.ones_like(point_volume[..., :1])], dim=-1), 
                                                rt.T)
-            uv, _ = project(point_volume_in_cam[..., :3], calibration)
+            uv, _ = cam_model.project(point_volume_in_cam[..., :3])
             uv = ((uv + 0.5) / torch.tensor([self.matching_resolution[0], 
                                      self.matching_resolution[1]], device=self.device)) * 2 - 1
             uv = uv.unsqueeze(0)
@@ -229,7 +228,7 @@ class RGBD_Estimator:
                 self.estimate_fisheye_distance(
                     images_to_match_permuted[reference_index], 
                     guide,
-                    self.calibrations[reference_index], 
+                    self.cam_models[reference_index], 
                     selected_camera, 
                     images_to_match_permuted, 
                 )
