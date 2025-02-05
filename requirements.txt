@@ -1,0 +1,8 @@
+numpy
+scipy
+torch
+torchvision
+cupy-cuda12x
+opencv-python
+scikit-image
+joblib

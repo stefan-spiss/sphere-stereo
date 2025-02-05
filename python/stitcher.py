@@ -28,22 +28,23 @@ Warranty: KAIST-VCLAB MAKES NO REPRESENTATIONS OR WARRANTIES ABOUT THE SUITABILI
 Please refer to license.txt for more details.
 =======================================================================
 """
-import torch 
-import cupy
 import math
 
-def vectorize_calibration(calibration, device):
-    """
-    Convert the intrinsics into a continuous float vector that follows the Intrinsics' structure
-    (See stitcher.cu for Intrinsics' definition)
-    Scale the focal length and the principal point using the matching scale.
-    """
-    calibration_vector = torch.zeros([6], device=device)
-    calibration_vector[0:2] = calibration.fl * calibration.matching_scale
-    calibration_vector[2:4] = calibration.principal * calibration.matching_scale
-    calibration_vector[4] = calibration.xi
-    calibration_vector[5] = calibration.alpha
-    return calibration_vector
+import cupy
+import torch
+
+# def vectorize_calibration(calibration, device):
+#     """
+#     Convert the intrinsics into a continuous float vector that follows the Intrinsics' structure
+#     (See stitcher.cu for Intrinsics' definition)
+#     Scale the focal length and the principal point using the matching scale.
+#     """
+#     calibration_vector = torch.zeros([6], device=device)
+#     calibration_vector[0:2] = calibration.fl * calibration.matching_scale
+#     calibration_vector[2:4] = calibration.principal * calibration.matching_scale
+#     calibration_vector[4] = calibration.xi
+#     calibration_vector[5] = calibration.alpha
+#     return calibration_vector
 
 class Stitcher:
     def __init__(self, calibrations, reprojection_viewpoint, masks, min_dist, max_dist, 
@@ -79,10 +80,24 @@ class Stitcher:
         reprojection_viewpoint = torch.cat([reprojection_viewpoint, torch.ones([1], device=device)])
 
         # Read and compile CUDA functions
-        with open('python/vec_utils.cuh', 'r') as f:
+        with open('python/vec_utils.cuh') as f:
             utils_source = f.read()
-        with open('python/stitcher.cu', 'r') as f:
-            cuda_source = utils_source + f.read()
+
+        cam_model = calibrations[0].model
+        for calib in calibrations:
+            if calib.model != cam_model:
+                raise ValueError("All cameras should have the same model")
+
+        if cam_model == "double_sphere":
+            with open('python/stitcher.cu') as f:
+                cuda_source = utils_source + f.read()
+        elif cam_model == "cv_fisheye":
+            with open('python/stitcher_cv.cu') as f:
+                cuda_source = utils_source + f.read()
+                cuda_source = cuda_source.replace("MAX_ITER", str(calibrations[0].unproj_crit[1]))
+                cuda_source = cuda_source.replace("EPSILON", str(calibrations[0].unproj_crit[2]))
+        else:
+            raise ValueError("Unknown camera model")
 
         cuda_source = cuda_source.replace("PANO_COLS", str(panorama_resolution[0]))
         cuda_source = cuda_source.replace("PANO_ROWS", str(panorama_resolution[1]))
@@ -91,6 +106,7 @@ class Stitcher:
         cuda_source = cuda_source.replace("REFERENCES_COUNT", str(len(calibrations)))
         cuda_source = cuda_source.replace("MIN_DIST", str(min_dist))
         cuda_source = cuda_source.replace("MAX_DIST", str(max_dist))
+
         module = cupy.RawModule(code=cuda_source)
         
         self.reproject_distance_cuda = module.get_function('reprojectDistanceKernel')
@@ -126,7 +142,7 @@ class Stitcher:
         self.translations_list = []
         self.calibration_vectors_list = []
         for calibration, inpainting_weight in zip(calibrations, self.inpainting_weights_list):
-            calibration_vector = vectorize_calibration(calibration, device)
+            calibration_vector = calibration.vectorize_calibration()
             translation = torch.matmul(torch.inverse(calibration.rt), reprojection_viewpoint)[:3]
             self.translations_list.append(translation)
             self.calibration_vectors_list.append(calibration_vector)

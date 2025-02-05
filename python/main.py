@@ -28,18 +28,23 @@ Warranty: KAIST-VCLAB MAKES NO REPRESENTATIONS OR WARRANTIES ABOUT THE SUITABILI
 Please refer to license.txt for more details.
 =======================================================================
 """
-import cupy
-from depth_estimation import RGBD_Estimator
-from utils import parse_json_calib, read_input_images, evaluate_rgbd_panorama, save_rgbd_panorama
-
-from pathlib import Path
-import os.path 
-import torch
-import json
 import argparse
+import json
+import os.path
+from pathlib import Path
+
 import cv2
 import numpy as np
+import torch
+from depth_estimation import RGBD_Estimator
 from joblib import Parallel, delayed
+from utils import (
+    evaluate_rgbd_panorama,
+    parse_json_calib,
+    parse_json_calib_cv,
+    read_input_images,
+    save_rgbd_panorama,
+)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -58,11 +63,15 @@ if __name__ == "__main__":
     parser.add_argument('--visualize', type=bool, default=False)
     parser.add_argument('--evaluate', type=bool, default=False)
     parser.add_argument('--bad_px_ratio_thresholds', type=float, default=[0.1, 0.4])
+    parser.add_argument('--cv_fisheye', type=bool, default=False)
     args = parser.parse_args()
 
-    f = open(os.path.join(args.dataset_path, "calibration.json"))
-    raw_calibration = json.load(f)['value0']
-    cam_models = parse_json_calib(raw_calibration, args.matching_resolution, args.device)
+    if args.cv_fisheye:
+        cam_models = parse_json_calib_cv(os.path.join(args.dataset_path, "calibrated_cameras_data.yml"), args.matching_resolution, args.device)
+    else:
+        f = open(os.path.join(args.dataset_path, "calibration.json"))
+        raw_calibration = json.load(f)['value0']
+        cam_models = parse_json_calib(raw_calibration, args.matching_resolution, args.device)
 
     # Reference viewpoint for the estimated RGB-D panorama is the center of the references
     reprojection_viewpoint = torch.zeros([3], device=args.device)

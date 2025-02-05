@@ -28,25 +28,31 @@ Warranty: KAIST-VCLAB MAKES NO REPRESENTATIONS OR WARRANTIES ABOUT THE SUITABILI
 Please refer to license.txt for more details.
 =======================================================================
 """
+import logging
 import math
 import os.path
+# import sys
 import warnings
 from abc import ABC, abstractmethod
 
 import cv2
 import numpy as np
 import torch
+from log_utils import setupLogger
+from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation as R
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
+logger = setupLogger(__name__, logging.DEBUG)
 
 class CamModel(ABC):
-    def __init__(self, device='cpu'):
-        self.id: int = -1
-        self.model: str = ''
-        self.original_resolution: tuple[int, int] = (0, 0)
-        self.rt = torch.eye(4, device=device)
-        self.matching_scale: torch.Tensor = torch.Tensor(1.0, 1.0).to(device)
+    def __init__(self, model: str, original_resolution: torch.Tensor, rt: torch.Tensor, matching_scale: torch.Tensor, device: torch.device | str ='cpu'):
+        # self.id: int = -1
+        self.model: str = model
+        self.device: torch.device = torch.device(device)
+        self.original_resolution: torch.Tensor = original_resolution.to(device)
+        self.rt: torch.Tensor = rt.to(device)
+        self.matching_scale: torch.Tensor = matching_scale.to(device)
 
     @abstractmethod
     def unproject(self, uv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -56,8 +62,12 @@ class CamModel(ABC):
     def project(self, point: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         pass
 
+    @abstractmethod
+    def vectorize_calibration(self) -> torch.Tensor:
+        pass
+
 class DoubleSphereModel(CamModel):
-    def __init__(self, original_resolution, principal, fl, xi, alpha, rt, matching_scale):
+    def __init__(self, original_resolution: torch.Tensor, principal: torch.Tensor, fl: torch.Tensor, xi: float, alpha: float, rt: torch.Tensor, matching_scale: torch.Tensor, device: torch.device | str):
         """
         Args:
             original_resolution, principal, fl, xi, alpha: Double sphere intrinsics
@@ -65,14 +75,13 @@ class DoubleSphereModel(CamModel):
             matching_scale: [2] Scale to apply to the resolution, principal and fl 
                 when working with images resized to the matching resolution
         """
-        super().__init__(rt.device)
-        self.original_resolution = original_resolution
-        self.principal = principal
-        self.fl = fl
-        self.xi = xi
-        self.alpha = alpha
-        self.rt = rt
-        self.matching_scale = matching_scale 
+        super().__init__('double_sphere', original_resolution, rt, matching_scale, device)
+        self.principal: torch.Tensor = principal
+        self.fl: torch.Tensor = fl
+        self.xi: float = xi
+        self.alpha: float = alpha
+        logger.debug(f'Init cam model {self.model}:\n-device: {self.device}\n-original_resolution: {self.original_resolution}\n-rt: {self.rt}\n-matching_scale: {self.matching_scale}\n-principal: {self.principal}\n-fl: {self.fl}\n-xi: {self.xi}\n-alpha: {self.alpha}')
+
 
     def unproject(self, uv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -110,6 +119,126 @@ class DoubleSphereModel(CamModel):
         uv = (self.fl * self.matching_scale * point[..., :2]) / norm + self.principal * self.matching_scale
         return uv, valid[..., 0]
 
+    def vectorize_calibration(self):
+        """
+        Convert the intrinsics into a continuous float vector that follows the Intrinsics' structure
+        (See stitcher.cu for Intrinsics' definition)
+        Scale the focal length and the principal point using the matching scale.
+        """
+        calibration_vector = torch.zeros([6], device=self.device)
+        calibration_vector[0:2] = self.fl * self.matching_scale
+        calibration_vector[2:4] = self.principal * self.matching_scale
+        calibration_vector[4] = self.xi
+        calibration_vector[5] = self.alpha
+        return calibration_vector
+
+
+class CVFisheyeModel(CamModel):
+    def __init__(self, original_resolution: torch.Tensor, principal: torch.Tensor, fl: torch.Tensor, dist_params: torch.Tensor, rt: torch.Tensor, matching_scale: torch.Tensor, device: torch.device | str, max_theta: float = np.pi, unproj_crit: tuple[int, int, float] = (cv2.TERM_CRITERIA_MAX_ITER + cv2.TERM_CRITERIA_EPS, 10, 1e-8)):
+        
+        super().__init__('cv_fisheye', original_resolution, rt, matching_scale, device)
+        self.principal = principal
+        self.fl = fl
+        self.dist_params = dist_params
+        self.unproj_crit = unproj_crit
+        self.max_theta = max_theta
+        logger.debug(f'Init cam model {self.model}:\n-device: {self.device}\n-original_resolution: {self.original_resolution}\n-rt: {self.rt}\n-matching_scale: {self.matching_scale}\n-principal: {self.principal}\n-fl: {self.fl}\n-dist_params: {self.dist_params}\n-max_theta: {self.max_theta}\n-unproj_crit: {self.unproj_crit}')
+
+    def unproject(self, uv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        m_xy = (uv - self.principal * self.matching_scale) / self.fl * self.matching_scale
+
+        theta_d = torch.sqrt(torch.sum(m_xy**2, dim=-1, keepdim=True))
+        theta_d = torch.min(torch.max(torch.tensor(-torch.pi * 0.5), theta_d), torch.tensor(torch.pi *0.5))
+        theta = torch.clone(theta_d)
+        scale = 0.0
+
+        for _ in range(self.unproj_crit[1]):
+            theta2 = theta.mul(theta)
+            theta4 = theta2.mul(theta2)
+            theta6 = theta4.mul(theta2)
+            theta8 = theta6.mul(theta2)
+            k0_theta2 = self.dist_params[0] * theta2
+            k1_theta4 = self.dist_params[1] * theta4
+            k2_theta6 = self.dist_params[2] * theta6
+            k3_theta8 = self.dist_params[3] * theta8
+            theta_fix = (theta * (1 + k0_theta2 + k1_theta4 + k2_theta6 + k3_theta8) - theta_d) / (1.0 + 3*k0_theta2 + 5*k1_theta4 + 7*k2_theta6 + 9*k3_theta8)
+            theta = theta - theta_fix
+
+            if (torch.all(torch.abs(theta_fix) < self.unproj_crit[2])):
+                break
+
+        scale = torch.tan(theta) / theta_d
+
+        theta_flipped = ((theta_d < 0) & (theta > 0)) | ((theta_d > 0) & (theta < 0))
+
+        m_xy = m_xy * scale
+        points = torch.cat([m_xy, torch.ones_like(m_xy[..., 0]).unsqueeze(-1)], dim=-1)
+        points = points / torch.sqrt(torch.sum(points**2, dim=-1, keepdim=True))
+
+        theta_sphere = torch.acos(points[..., 2]).unsqueeze(-1)
+        
+        points = torch.where(theta_flipped | (theta_sphere > self.max_theta), torch.nan, points)
+        valid = torch.where(points == torch.nan, False, True)
+        return points, valid[..., 0]
+    
+    def k(self):
+        fl = (self.fl * self.matching_scale).cpu().numpy()
+        principal = (self.principal * self.matching_scale).cpu().numpy()
+        return np.array([[fl[0], 0, principal[0]], [0, fl[1], principal[1]], [0., 0., 1.]]).astype(np.float32)
+
+    def d(self):
+        dist_params = self.dist_params.cpu().numpy()
+        return dist_params.astype(np.float32)
+
+
+
+    def project(self, point: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        uv = point[..., :2] / point[..., 2].unsqueeze(-1)
+        r = torch.norm(point, dim=-1, keepdim=True)
+        theta = torch.atan(r)
+        theta2 = theta.mul(theta)
+        theta3 = theta2.mul(theta)
+        theta4 = theta2.mul(theta2)
+        theta5 = theta4.mul(theta)
+        theta6 = theta3.mul(theta3)
+        theta7 = theta6.mul(theta)
+        theta8 = theta4.mul(theta4)
+        theta9 = theta8.mul(theta)
+
+        theta_d = theta + self.dist_params[0] * theta3 + self.dist_params[1] * theta5 + self.dist_params[2] * theta7 + self.dist_params[3] * theta9
+
+        cdist = torch.where(r > 1e-8, theta_d * 1.0/r, 1.0)
+
+        uv = (uv * cdist) * self.fl * self.matching_scale + self.principal * self.matching_scale
+        valid = torch.where(theta > self.max_theta, False, True)
+
+        return uv, valid[..., 0]
+        
+        #points = point.detach().squeeze().cpu().numpy()
+        #norm = np.sqrt(points[..., 0]**2 + points[..., 1]**2) + sys.float_info.epsilon
+        #theta = np.arctan2(-points[..., 2], norm)
+        #theta = theta + np.pi / 2
+        ##convert points to (n, 1, 3)
+        #points = points.reshape(-1, 1, 3)
+        #distorted_points, _ = cv2.fisheye.projectPoints(points, np.zeros((3, 1)), np.zeros((3, 1)), self.k(), self.d())
+        #new_shape = list(point.shape[:-1])
+        #new_shape.append(2)
+        #distorted_points = distorted_points.reshape(new_shape)
+        ## distorted_points[:,theta.squeeze() > self.max_theta] = -1.0
+        #return torch.tensor(distorted_points, device=point.device), torch.tensor(theta.squeeze() <= self.max_theta, device=point.device).unsqueeze(0)
+
+    def vectorize_calibration(self):
+        """
+        Convert the intrinsics into a continuous float vector that follows the Intrinsics' structure
+        (See stitcher.cu for Intrinsics' definition)
+        Scale the focal length and the principal point using the matching scale.
+        """
+        calibration_vector = torch.zeros([9], device=self.device)
+        calibration_vector[0:2] = self.fl * self.matching_scale
+        calibration_vector[2:4] = self.principal * self.matching_scale
+        calibration_vector[4:8] = self.dist_params
+        calibration_vector[8] = self.max_theta
+        return calibration_vector
 
 
 def parse_json_calib(raw_calibration, matching_resolution, device)->list[CamModel]:
@@ -146,7 +275,7 @@ def parse_json_calib(raw_calibration, matching_resolution, device)->list[CamMode
         rt[:3, 3] = t
 
         cam_models.append(DoubleSphereModel(
-            original_resolution,
+            torch.tensor(original_resolution),
             torch.tensor([cam_intrinsics['cx'], cam_intrinsics['cy']], device=device),
             torch.tensor([cam_intrinsics['fx'], cam_intrinsics['fy']], device=device),
             cam_intrinsics['xi'],
@@ -155,10 +284,97 @@ def parse_json_calib(raw_calibration, matching_resolution, device)->list[CamMode
             torch.tensor([
                     matching_resolution[0] / original_resolution[0],
                     matching_resolution[1] / original_resolution[1]
-                ], device=device)
+                ], device=device),
+            device
         ))
 
     return cam_models
+
+
+def parse_json_calib_cv(file_path, matching_resolution, device, max_theta=2.0*np.pi) -> list[CamModel]:
+    fs_config = cv2.FileStorage(file_path, cv2.FILE_STORAGE_READ)
+
+    num_cams = int(fs_config.getNode('nb_camera').real())
+
+    cam_group = -1
+    models = []
+    cam_matrices = []
+    cam_distortions = []
+    image_sizes = []
+    poses = []
+
+    for i in range(num_cams):
+        cam_cfg = fs_config.getNode(f'camera_{i}')
+        if cam_cfg is None:
+            logger.error(
+                f'Failed to read camera config for camera {i} from multi-camera calibration config file {file_path}'
+            )
+            raise ValueError(
+                f'Failed to read camera config for camera {i} from multi-camera calibration config file {file_path}'
+            )
+
+        # for now only fisheye cameras are supported
+        if int(cam_cfg.getNode('distortion_type').real()) != 1:
+            logger.error(f'Only fisheye cameras are supported. Camera {i} is not a fisheye camera.')
+            raise ValueError(
+                f'Only fisheye cameras are supported. Camera {i} is not a fisheye camera.'
+            )
+        models.append('cvfisheye')
+        cam_matrices.append(cam_cfg.getNode('camera_matrix').mat())
+        cam_distortions.append(cam_cfg.getNode('distortion_vector').mat())
+        image_sizes.append(
+            (int(cam_cfg.getNode('img_width').real()), int(cam_cfg.getNode('img_height').real()))
+        )
+
+        if i == 0:
+            cam_group = int(cam_cfg.getNode('camera_group').real())
+        else:
+            if cam_group != int(cam_cfg.getNode('camera_group').real()):
+                logger.error(
+                    'All cameras in the multi-camera calibration config file must belong to the same camera group'
+                )
+                raise ValueError(
+                    'All cameras in the multi-camera calibration config file must belong to the same camera group'
+                )
+
+        poses.append(cam_cfg.getNode('camera_pose_matrix').mat())
+
+    # t_center = np.zeros((3, 1), poses[0].dtype)
+    # for pose in poses:
+    #     t_center += translation(pose)
+
+    # t_center /= num_cams
+
+    # for pose in poses:
+    #     pose[:3, 3] += t_center.flatten()
+
+    cam_models = []
+    for image_size, cam_matrix, dist_params, rt in zip(
+        image_sizes, cam_matrices, cam_distortions, poses, strict=True
+    ):
+        original_resolution = torch.tensor(image_size)
+        cam_models.append(
+            CVFisheyeModel(
+                original_resolution,
+                torch.tensor([cam_matrix[0, 2], cam_matrix[1, 2]], device=device, dtype=torch.float32),
+                torch.tensor([cam_matrix[0, 0], cam_matrix[1, 1]], device=device, dtype=torch.float32),
+                torch.tensor(dist_params.flatten(), device=device, dtype=torch.float32),
+                torch.tensor(rt, device=device, dtype=torch.float32),
+                torch.tensor(
+                    [
+                        matching_resolution[0] / original_resolution[0],
+                        matching_resolution[1] / original_resolution[1],
+                    ],
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                device,
+                max_theta,
+            )
+        )
+
+    return cam_models
+
 
 def rgb2yCbCr(rgb):
     rgb = rgb.float()
@@ -278,3 +494,10 @@ def save_rgbd_panorama(rgbd_panoramas, filename, dataset_path):
                     rgbd_panorama["inv_distance"])
     except KeyError:
         pass
+
+def translation(transform: NDArray) -> NDArray:
+    if transform.shape == (3, 4) or transform.shape == (4, 4):
+        return transform[:3, 3].reshape((3, 1))
+    else:
+        logger.error(f"Invalid transform shape, {transform.shape}")
+        raise ValueError(f"Invalid transform shape, {transform.shape}")
