@@ -29,9 +29,16 @@ Please refer to license.txt for more details.
 =======================================================================
 """
 import math
+from os import name
+import sys
 
 import cupy
+from cv2 import log
+from numpy import std
 import torch
+
+from log_utils import LOG_DEBUG, LOG_ERROR, LOG_INFO
+from utils import CamModel
 
 # def vectorize_calibration(calibration, device):
 #     """
@@ -47,9 +54,9 @@ import torch
 #     return calibration_vector
 
 class Stitcher:
-    def __init__(self, calibrations, reprojection_viewpoint, masks, min_dist, max_dist, 
-                 matching_resolution, rgb_to_stitch_resolution, panorama_resolution, 
-                 device, smoothing_radius = 15, inpainting_iterations = 32):
+    def __init__(self, calibrations: list[CamModel], reprojection_viewpoint: torch.Tensor, masks: list[torch.Tensor], min_dist: float, max_dist: float, 
+                 matching_resolution: list[int], rgb_to_stitch_resolution: list[int], panorama_resolution: list[int], 
+                 device: torch.device | str, smoothing_radius: int = 15, inpainting_iterations: int = 32):
         """
         Stitcher to create RGB-D panoramas from RGB-D fisheye images.
         Compile CUDA functions, allocate intermediate arrays and compute tables
@@ -96,6 +103,7 @@ class Stitcher:
                 cuda_source = utils_source + f.read()
                 cuda_source = cuda_source.replace("MAX_ITER", str(calibrations[0].unproj_crit[1]))
                 cuda_source = cuda_source.replace("EPSILON", str(calibrations[0].unproj_crit[2]))
+                cuda_source = cuda_source.replace("MIN_LIMIT", str(calibrations[0].proj_crit))
         else:
             raise ValueError("Unknown camera model")
 
@@ -107,13 +115,30 @@ class Stitcher:
         cuda_source = cuda_source.replace("MIN_DIST", str(min_dist))
         cuda_source = cuda_source.replace("MAX_DIST", str(max_dist))
 
-        module = cupy.RawModule(code=cuda_source)
-        
-        self.reproject_distance_cuda = module.get_function('reprojectDistanceKernel')
+
+        # LOG_DEBUG(f"Cuda source:\n{cuda_source}")
+
+        kernel_names = ['reprojectDistanceKernel', 'mergeRGBDPanoramaKernel', 'createInpaintingWeightsKernel', 'createBlendingLutKernel']
+        if cam_model == "cv_fisheye":
+            ext = '<FisheyeKB>' if calibrations[0].use_perspective_reproj else '<FisheyeKBPerspectiveProjection>'
+            for i in range(len(kernel_names)):
+                kernel_names[i] += ext
+
+        try:
+            # module = cupy.RawModule(code=cuda_source, options=("-std=c++11", "-Xptxas"))
+            # module = cupy.RawModule(code=cuda_source, options=("-std=c++11", "-rdc=true"))
+            module = cupy.RawModule(code=cuda_source, options=("-std=c++11",), name_expressions=kernel_names)
+            module.compile()
+            LOG_INFO("CUDA compilation successful")
+        except cupy.cuda.compiler.CompileException as e:
+            LOG_ERROR(f"Compilation failed: {e}")
+            raise e
+
+        self.reproject_distance_cuda = module.get_function(kernel_names[0])
         self.inpaint_cuda = module.get_function('inpaintKernel')
-        self.merge_rgbd_panorama_cuda = module.get_function('mergeRGBDPanoramaKernel')
-        create_inpainting_weights_cuda = module.get_function('createInpaintingWeightsKernel')
-        create_blending_luts_cuda = module.get_function('createBlendingLutKernel')
+        self.merge_rgbd_panorama_cuda = module.get_function(kernel_names[1])
+        create_inpainting_weights_cuda = module.get_function(kernel_names[2])
+        create_blending_luts_cuda = module.get_function(kernel_names[3])
 
         # Allocate tables and intermediate arrays
         self.reprojected_distances = torch.zeros([len(calibrations), matching_rows, matching_cols], device=device)
@@ -141,7 +166,7 @@ class Stitcher:
         # Create tables for inpainting
         self.translations_list = []
         self.calibration_vectors_list = []
-        for calibration, inpainting_weight in zip(calibrations, self.inpainting_weights_list):
+        for calibration, inpainting_weight in zip(calibrations, self.inpainting_weights_list, strict=True):
             calibration_vector = calibration.vectorize_calibration()
             translation = torch.matmul(torch.inverse(calibration.rt), reprojection_viewpoint)[:3]
             self.translations_list.append(translation)

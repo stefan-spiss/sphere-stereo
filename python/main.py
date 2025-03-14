@@ -38,6 +38,7 @@ import numpy as np
 import torch
 from depth_estimation import RGBD_Estimator
 from joblib import Parallel, delayed
+from log_utils import initLogging
 from utils import (
     evaluate_rgbd_panorama,
     parse_json_calib,
@@ -64,10 +65,14 @@ if __name__ == "__main__":
     parser.add_argument('--evaluate', type=bool, default=False)
     parser.add_argument('--bad_px_ratio_thresholds', type=float, default=[0.1, 0.4])
     parser.add_argument('--cv_fisheye', type=bool, default=False)
+    parser.add_argument('--use_perspective_reproj', type=bool, default=False)
+    parser.add_argument('--recalculate_fov', type=bool, default=True)
     args = parser.parse_args()
+    
+    initLogging("DEBUG")
 
     if args.cv_fisheye:
-        cam_models = parse_json_calib_cv(os.path.join(args.dataset_path, "calibrated_cameras_data.yml"), args.matching_resolution, args.device)
+        cam_models = parse_json_calib_cv(os.path.join(args.dataset_path, "calibrated_cameras_data.yml"), args.matching_resolution, args.use_perspective_reproj, args.device, np.pi, args.recalculate_fov)
     else:
         f = open(os.path.join(args.dataset_path, "calibration.json"))
         raw_calibration = json.load(f)['value0']

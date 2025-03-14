@@ -30,14 +30,18 @@ Please refer to license.txt for more details.
 =======================================================================
 """
 
-from isb_filter import ISB_Filter
-from stitcher import Stitcher
-from utils import rgb2yCbCr
+import cv2
+import numpy as np
 import torch
+from isb_filter import ISB_Filter
+from log_utils import LOG_DEBUG
+from stitcher import Stitcher
+from utils import CamModel, rgb2yCbCr
+
 
 class RGBD_Estimator:
-    def __init__(self, cam_models, min_dist, max_dist, candidate_count, references_indices, reprojection_viewpoint, 
-                 masks, matching_resolution, rgb_to_stitch_resolution, panorama_resolution, sigma_i, sigma_s, device):
+    def __init__(self, cam_models: list[CamModel], min_dist: float, max_dist: float, candidate_count: int, references_indices: list[int], reprojection_viewpoint: torch.Tensor, 
+                 masks: list[torch.Tensor], matching_resolution: list[int], rgb_to_stitch_resolution: list[int], panorama_resolution: list[int], sigma_i: float, sigma_s: float, device: torch.device | str):
         """
         Prepare RGB-D estimation from fisheye images. 
         Perform camera selection for adaptive matching, initialize filters and stitcher 
@@ -58,16 +62,16 @@ class RGBD_Estimator:
             sigma_s: Smoothing parameter. Higher values give more weight to coarser scales during filtering
             device: CUDA-enabled GPU used for processing
         """
-        self.cam_models = cam_models
-        self.min_dist = min_dist
-        self.max_dist = max_dist
-        self.candidate_count = candidate_count
-        self.references_indices = references_indices
-        self.reprojection_viewpoint = reprojection_viewpoint
-        self.matching_resolution = matching_resolution
-        self.device = device
-        self.sigma_i = sigma_i 
-        self.sigma_s = sigma_s
+        self.cam_models: list[CamModel] = cam_models
+        self.min_dist: float = min_dist
+        self.max_dist: float = max_dist
+        self.candidate_count: int = candidate_count
+        self.references_indices: list[int] = references_indices
+        self.reprojection_viewpoint: torch.Tensor = reprojection_viewpoint
+        self.matching_resolution: list[int] = matching_resolution
+        self.device: torch.device | str = device
+        self.sigma_i: float = sigma_i 
+        self.sigma_s: float = sigma_s
 
         self.cost_filter = ISB_Filter(candidate_count, matching_resolution, device)
         self.distance_filter = ISB_Filter(1, matching_resolution, device)
@@ -93,6 +97,9 @@ class RGBD_Estimator:
             u, v = torch.meshgrid([torch.arange(0, self.matching_resolution[1], device=self.device), 
                 torch.arange(0, self.matching_resolution[0], device=self.device)])
             pt_unit, reference_valid = reference_cam_model.unproject(torch.stack([v, u], dim=-1).unsqueeze(0))
+
+            LOG_DEBUG(f'nan entries in pt_unit: {torch.isnan(pt_unit).any()}')
+            LOG_DEBUG(f'all not valid: {torch.any(~reference_valid)}')
 
             # Go through all the matched cameras and select the best one per pixel
             for cam_index, (cam_model, mask) in enumerate(zip(self.cam_models, masks, strict=True)):
@@ -120,18 +127,79 @@ class RGBD_Estimator:
 
                 mask_near = torch.nn.functional.grid_sample(mask.unsqueeze(0), uv_near, align_corners=False)[0]
                 mask_far = torch.nn.functional.grid_sample(mask.unsqueeze(0), uv_far, align_corners=False)[0]
+
+                # mask_near_vis = mask_near.cpu().numpy().squeeze()
+                # LOG_DEBUG(f'ref-cam-{reference_index}/cam-{cam_index}: mask_near_vis: shape: {mask_near_vis.shape}, min: {mask_near_vis.min()}, max: {mask_near_vis.max()}')
+                # mask_near_vis = cv2.normalize(mask_near_vis, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                # cv2.imshow(f'ref-cam-{reference_index}/cam-{cam_index}: mask_near', mask_near_vis)
+                # mask_far_vis = mask_far.cpu().numpy().squeeze()
+                # LOG_DEBUG(f'ref-cam-{reference_index}/cam-{cam_index}: mask_far_vis: shape: {mask_far_vis.shape}, min: {mask_far_vis.min()}, max: {mask_far_vis.max()}')
+                # mask_far_vis = cv2.normalize(mask_far_vis, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                # cv2.imshow(f'ref-cam-{reference_index}/cam-{cam_index}: mask_far', mask_far_vis)
+                # disp_vis = displacement.cpu().numpy().squeeze()
+                # LOG_DEBUG(f'ref-cam-{reference_index}/cam-{cam_index}: disp_vis: shape: {disp_vis.shape}, min: {disp_vis.min()}, max: {disp_vis.max()}')
+                # disp_vis = cv2.normalize(disp_vis, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                # cv2.imshow(f'ref-cam-{reference_index}/cam-{cam_index}: disp', disp_vis)
                 
                 # Update the selected best camera
+                LOG_DEBUG(f'displacement shape = {displacement.shape}, max_displacement shape = {max_displacement.shape}')
+                LOG_DEBUG(f'nan displacement: {torch.isnan(displacement).any()}')
+                LOG_DEBUG(f'inf displacement: {torch.isinf(displacement).any()}')
+                LOG_DEBUG(f'nan max_displacement: {torch.isnan(max_displacement).any()}')
+                LOG_DEBUG(f'inf max_displacement: {torch.isinf(max_displacement).any()}')
+
                 current_best = ((displacement > max_displacement)
                                 * reference_valid
                                 * valid_near * valid_far
                                 * (masks[reference_index] >= 0.9) * (mask_near >= 0.9) * (mask_far >= 0.9))
 
                 max_displacement[current_best] = displacement[current_best]
+                # max_disp_vis = max_displacement.cpu().numpy().squeeze()
+                LOG_DEBUG(f'ref-cam-{reference_index}/cam-{cam_index}: max_disp_vis: shape: {max_displacement.shape}, min: {max_displacement.min()}, max: {max_displacement.max()}')
+                # max_disp_vis = cv2.normalize(max_disp_vis, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                # cv2.imshow(f'ref-cam-{reference_index}/cam-{cam_index}: max_disp', max_disp_vis)
 
                 selected_camera[current_best] = cam_index
+                LOG_DEBUG(f'ref-cam-{reference_index}/cam-{cam_index}: selected_camera_vis: shape: {selected_camera.shape}, min: {selected_camera.min()}, max: {selected_camera.max()}')
+                # selected_camera_numpy = selected_camera.cpu().numpy().squeeze()
+                # mask_0 = selected_camera_numpy == 0
+                # mask_1 = selected_camera_numpy == 1
+                # mask_2 = selected_camera_numpy == 2 
+                # mask_3 = selected_camera_numpy == 3 
+                # mask_4 = selected_camera_numpy == 4 
+                # mask_5 = selected_camera_numpy == 5 
+                # selected_camera_vis = np.zeros((*selected_camera_numpy.shape, 3), dtype=np.uint8)
+                # selected_camera_vis[mask_0] = [255, 0, 0]  # Red for camera 0
+                # selected_camera_vis[mask_1] = [0, 255, 0]  # Green for camera 1
+                # selected_camera_vis[mask_2] = [0, 0, 255]  # Blue for camera 2
+                # selected_camera_vis[mask_3] = [255, 255, 0]  # Yellow for camera 3
+                # selected_camera_vis[mask_4] = [255, 0, 255]  # Magenta for camera 4
+                # selected_camera_vis[mask_5] = [0, 255, 255]  # Cyan for camera 5
+                # cv2.cvtColor(selected_camera_vis, cv2.COLOR_RGB2BGR, selected_camera_vis)
+                # cv2.imshow(f'ref-cam-{reference_index}/cam-{cam_index}: selected_camera_vis', selected_camera_vis)
+                # cv2.waitKey(0)
+                # cv2.destroyAllWindows()
     
             self.selected_cameras.append(selected_camera)
+            selected_camera_numpy = selected_camera.cpu().numpy().squeeze()
+            LOG_DEBUG(f'ref-cam-{reference_index}: selected_camera_vis: shape: {selected_camera_numpy.shape}, min: {selected_camera_numpy.min()}, max: {selected_camera_numpy.max()}')
+            mask_0 = selected_camera_numpy == 0
+            mask_1 = selected_camera_numpy == 1
+            mask_2 = selected_camera_numpy == 2 
+            mask_3 = selected_camera_numpy == 3 
+            mask_4 = selected_camera_numpy == 4 
+            mask_5 = selected_camera_numpy == 5 
+            selected_camera_vis = np.zeros((*selected_camera_numpy.shape, 3), dtype=np.uint8)
+            selected_camera_vis[mask_0] = [255, 0, 0]  # Red for camera 0
+            selected_camera_vis[mask_1] = [0, 255, 0]  # Green for camera 1
+            selected_camera_vis[mask_2] = [0, 0, 255]  # Blue for camera 2
+            selected_camera_vis[mask_3] = [255, 255, 0]  # Yellow for camera 3
+            selected_camera_vis[mask_4] = [255, 0, 255]  # Magenta for camera 4
+            selected_camera_vis[mask_5] = [0, 255, 255]  # Cyan for camera 5
+            cv2.cvtColor(selected_camera_vis, cv2.COLOR_RGB2BGR, selected_camera_vis)
+            cv2.imshow(f'ref-cam-{reference_index}: selected_camera_vis', selected_camera_vis)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
 
     def estimate_fisheye_distance(self, reference_image, guide, reference_cam_model, selected_camera, images):
         """
@@ -217,6 +285,10 @@ class RGBD_Estimator:
         """
         
         
+        for i, img in enumerate(images_to_match):
+            cv2.imshow(f"image {i}", img.cpu().numpy().astype(np.uint8))
+
+        cv2.waitKey(0)
         # Evaluate distance for each of the reference fisheye images
         images_to_match_permuted = [image.unsqueeze(0).permute(0, 3, 1, 2).unsqueeze(2)
                                     for image in images_to_match]
@@ -233,6 +305,10 @@ class RGBD_Estimator:
                     images_to_match_permuted, 
                 )
             )
+        for i, img in enumerate(distance_maps):
+            cv2.imshow(f"dist {i}", img.cpu().numpy().astype(np.uint8))
+
+        cv2.waitKey(0)
 
         # Stitch in a disparity aware manner to create complete panoramas
         images_to_stitch = [reference_image.type(torch.uint8)
