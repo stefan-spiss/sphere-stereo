@@ -31,7 +31,9 @@ Please refer to license.txt for more details.
 import logging
 import math
 import os.path
+
 # import sys
+import sys
 import warnings
 from abc import ABC, abstractmethod
 
@@ -134,98 +136,137 @@ class DoubleSphereModel(CamModel):
 
 
 class CVFisheyeModel(CamModel):
-    def __init__(self, original_resolution: torch.Tensor, principal: torch.Tensor, fl: torch.Tensor, dist_params: torch.Tensor, rt: torch.Tensor, matching_scale: torch.Tensor, device: torch.device | str, max_theta: float = np.pi, unproj_crit: tuple[int, int, float] = (cv2.TERM_CRITERIA_MAX_ITER + cv2.TERM_CRITERIA_EPS, 10, 1e-8)):
+    def __init__(
+        self,
+        original_resolution: torch.Tensor,
+        principal: torch.Tensor,
+        fl: torch.Tensor,
+        dist_params: torch.Tensor,
+        rt: torch.Tensor,
+        matching_scale: torch.Tensor,
+        use_perspective_reproj: bool,
+        device: torch.device | str,
+        max_theta: float = np.pi,
+        recalculate_fov: bool = False,
+        proj_crit: float = 1e-8,
+        unproj_crit: tuple[int, float, float] = (
+            10,
+            1e-8,
+            1e-6
+        ),
+    ):
         
         super().__init__('cv_fisheye', original_resolution, rt, matching_scale, device)
         self.principal = principal
         self.fl = fl
         self.dist_params = dist_params
+        self.use_perspective_reproj = use_perspective_reproj
+        self.proj_crit = proj_crit
         self.unproj_crit = unproj_crit
-        self.max_theta = max_theta
-        logger.debug(f'Init cam model {self.model}:\n-device: {self.device}\n-original_resolution: {self.original_resolution}\n-rt: {self.rt}\n-matching_scale: {self.matching_scale}\n-principal: {self.principal}\n-fl: {self.fl}\n-dist_params: {self.dist_params}\n-max_theta: {self.max_theta}\n-unproj_crit: {self.unproj_crit}')
+        if recalculate_fov:
+            self.max_theta = self.__calculateFoV().max().item() * 0.5
+        else:
+            self.max_theta = max_theta
+        
+        if self.use_perspective_reproj:
+            self.max_theta = min(self.max_theta, np.pi * 0.5)
+
+        logger.debug(
+            f'Init cam model {self.model}:\
+                \n-device: {self.device}\
+                \n-original_resolution: {self.original_resolution}\
+                \n-rt: {self.rt}\
+                \n-matching_scale: {self.matching_scale}\
+                \n-principal: {self.principal}\
+                \n-fl: {self.fl}\
+                \n-dist_params: {self.dist_params}\
+                \n-max_theta: {self.max_theta}\
+                \n-use_perspective_reproj: {self.use_perspective_reproj}\
+                \n-proj_crit: {self.proj_crit}\
+                \n-unproj_crit: {self.unproj_crit}'
+        )
 
     def unproject(self, uv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        m_xy = (uv - self.principal * self.matching_scale) / self.fl * self.matching_scale
-
-        theta_d = torch.sqrt(torch.sum(m_xy**2, dim=-1, keepdim=True))
-        theta_d = torch.min(torch.max(torch.tensor(-torch.pi * 0.5), theta_d), torch.tensor(torch.pi *0.5))
-        theta = torch.clone(theta_d)
-        scale = 0.0
-
-        for _ in range(self.unproj_crit[1]):
-            theta2 = theta.mul(theta)
-            theta4 = theta2.mul(theta2)
-            theta6 = theta4.mul(theta2)
-            theta8 = theta6.mul(theta2)
-            k0_theta2 = self.dist_params[0] * theta2
-            k1_theta4 = self.dist_params[1] * theta4
-            k2_theta6 = self.dist_params[2] * theta6
-            k3_theta8 = self.dist_params[3] * theta8
-            theta_fix = (theta * (1 + k0_theta2 + k1_theta4 + k2_theta6 + k3_theta8) - theta_d) / (1.0 + 3*k0_theta2 + 5*k1_theta4 + 7*k2_theta6 + 9*k3_theta8)
-            theta = theta - theta_fix
-
-            if (torch.all(torch.abs(theta_fix) < self.unproj_crit[2])):
-                break
-
-        scale = torch.tan(theta) / theta_d
-
-        theta_flipped = ((theta_d < 0) & (theta > 0)) | ((theta_d > 0) & (theta < 0))
-
-        m_xy = m_xy * scale
-        points = torch.cat([m_xy, torch.ones_like(m_xy[..., 0]).unsqueeze(-1)], dim=-1)
-        points = points / torch.sqrt(torch.sum(points**2, dim=-1, keepdim=True))
-
-        theta_sphere = torch.acos(points[..., 2]).unsqueeze(-1)
-        
-        points = torch.where(theta_flipped | (theta_sphere > self.max_theta), torch.nan, points)
-        valid = torch.where(points == torch.nan, False, True)
+        points, valid, theta = self.__unproject(uv)
+        valid = torch.logical_and(valid.unsqueeze(-1), theta <= self.max_theta)
+        # points[~valid[..., 0]] = torch.tensor([torch.nan, torch.nan, torch.nan], device=uv.device)
         return points, valid[..., 0]
     
     def k(self):
         fl = (self.fl * self.matching_scale).cpu().numpy()
         principal = (self.principal * self.matching_scale).cpu().numpy()
+        # logger.debug(np.array([[fl[0], 0, principal[0]], [0, fl[1], principal[1]], [0., 0., 1.]]).astype(np.float32))
         return np.array([[fl[0], 0, principal[0]], [0, fl[1], principal[1]], [0., 0., 1.]]).astype(np.float32)
 
     def d(self):
         dist_params = self.dist_params.cpu().numpy()
         return dist_params.astype(np.float32)
 
-
-
     def project(self, point: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        uv = point[..., :2] / point[..., 2].unsqueeze(-1)
-        r = torch.norm(point, dim=-1, keepdim=True)
-        theta = torch.atan(r)
-        theta2 = theta.mul(theta)
-        theta3 = theta2.mul(theta)
-        theta4 = theta2.mul(theta2)
-        theta5 = theta4.mul(theta)
-        theta6 = theta3.mul(theta3)
-        theta7 = theta6.mul(theta)
-        theta8 = theta4.mul(theta4)
-        theta9 = theta8.mul(theta)
+        """
+        Projects a 3D point onto a 2D plane using fisheye distortion parameters.
+        Args:
+            point (torch.Tensor): A tensor of shape (..., 3) representing the 3D points to be projected.
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+                - uv (torch.Tensor): A tensor of shape (..., 2) representing the 2D projected points.
+                - valid (torch.Tensor): A boolean tensor of shape (...) indicating whether each point is within the valid range.
+        """
 
-        theta_d = theta + self.dist_params[0] * theta3 + self.dist_params[1] * theta5 + self.dist_params[2] * theta7 + self.dist_params[3] * theta9
-
-        cdist = torch.where(r > 1e-8, theta_d * 1.0/r, 1.0)
-
-        uv = (uv * cdist) * self.fl * self.matching_scale + self.principal * self.matching_scale
-        valid = torch.where(theta > self.max_theta, False, True)
-
+        uv, valid, theta = self.__project(point)
+        valid = torch.logical_and(valid.unsqueeze(-1), theta <= self.max_theta)
+        # uv[~valid[..., 0]] = torch.tensor([torch.nan, torch.nan], device=point.device)
+        
         return uv, valid[..., 0]
         
-        #points = point.detach().squeeze().cpu().numpy()
-        #norm = np.sqrt(points[..., 0]**2 + points[..., 1]**2) + sys.float_info.epsilon
-        #theta = np.arctan2(-points[..., 2], norm)
-        #theta = theta + np.pi / 2
-        ##convert points to (n, 1, 3)
-        #points = points.reshape(-1, 1, 3)
-        #distorted_points, _ = cv2.fisheye.projectPoints(points, np.zeros((3, 1)), np.zeros((3, 1)), self.k(), self.d())
-        #new_shape = list(point.shape[:-1])
-        #new_shape.append(2)
-        #distorted_points = distorted_points.reshape(new_shape)
-        ## distorted_points[:,theta.squeeze() > self.max_theta] = -1.0
-        #return torch.tensor(distorted_points, device=point.device), torch.tensor(theta.squeeze() <= self.max_theta, device=point.device).unsqueeze(0)
+        # logger.debug(f'cvfisheye project: shape in: {point.shape}')
+
+        # # norm = torch.linalg.norm(point, dim=-1, keepdim=True) + 1e-8
+        # # theta = torch.arctan2(-point[..., 2], norm)
+        # # theta = theta + torch.tensor(np.pi / 2, device=point.device)
+
+        # uv = point[..., :2] / point[..., 2].unsqueeze(-1)
+        # r = torch.norm(point, dim=-1, keepdim=True)
+        # theta = torch.atan(r)
+        # theta2 = theta.mul(theta)
+        # theta3 = theta2.mul(theta)
+        # theta4 = theta2.mul(theta2)
+        # theta5 = theta4.mul(theta)
+        # theta6 = theta3.mul(theta3)
+        # theta7 = theta6.mul(theta)
+        # theta8 = theta4.mul(theta4)
+        # theta9 = theta8.mul(theta)
+
+        # theta_d = theta + self.dist_params[0] * theta3 + self.dist_params[1] * theta5 + self.dist_params[2] * theta7 + self.dist_params[3] * theta9
+
+        # invr = torch.where(r > 1e-8, 1.0/r, 1.0)
+        # cdist = torch.where(r > 1e-8, theta_d * invr, 1.0)
+
+        # uv = (uv * cdist) * self.fl * self.matching_scale + self.principal * self.matching_scale
+        # valid = torch.where(theta > self.max_theta, False, True)
+        # uv[~valid[..., 0]] = torch.tensor([torch.nan, torch.nan], device=point.device)
+
+        # logger.debug(f'cvfisheye project: shape out: uv: {uv.shape}, valid: {valid.shape}')
+        # # return uv, valid[..., 0]
+        
+        # points = point.detach().squeeze().cpu().numpy()
+        # norm = np.sqrt(points[..., 0]**2 + points[..., 1]**2) + sys.float_info.epsilon
+        # theta = np.arctan2(-points[..., 2], norm)
+        # theta = theta + np.pi / 2
+        # # convert points from (n, 3) to (n, 1, 3)
+        # points = points.reshape(-1, 1, 3)
+        # distorted_points, _ = cv2.fisheye.projectPoints(points, np.zeros((3, 1)), np.zeros((3, 1)), self.k(), self.d())
+        # new_shape = list(point.shape[:-1])
+        # new_shape.append(2)
+        # distorted_points = distorted_points.reshape(new_shape)
+        # distorted_points[theta.squeeze() > self.max_theta, :] = np.nan
+        # return torch.tensor(distorted_points, device=point.device), torch.tensor(theta.squeeze() <= self.max_theta, device=point.device).unsqueeze(0)
+
+        # uv_cv = torch.tensor(distorted_points, device=point.device)
+        # diff = uv-uv_cv
+        # diff_large = torch.where(torch.abs(diff) > 0.01, True, False)
+
+        # return uv, valid[..., 0]
 
     def vectorize_calibration(self):
         """
@@ -239,6 +280,198 @@ class CVFisheyeModel(CamModel):
         calibration_vector[4:8] = self.dist_params
         calibration_vector[8] = self.max_theta
         return calibration_vector
+
+    def __solveForTheta(self, r_theta: torch.Tensor, solver_params: tuple[int, float] = (10, 1e-8)) -> torch.Tensor:
+        """
+        Solves for the undistorted incidence angles theta using the Kanala and Brandt fisheye camera model given r(theta_distorted).
+        The solution is found using the Newton-Raphson method with a specified maximum number of iterations and a convergence threshold.
+
+        Args:
+            r_theta (torch.Tensor): The radii r(theta_distorted) from the principal point in the image plane for all distorted pixels (N, 1).
+            solver_params (tuple[int, float], optional): A tuple containing the maximum number of iterations and the convergence threshold. Default is (10, 1e-8).
+
+        Returns:
+            torch.Tensor: The incident angles for all undistorted pixels (N, 1).
+            torch.Tensor: The residuals of solving for the incident angels theta (N, 1).
+        """
+        theta = torch.clone(r_theta)
+        theta_fix = torch.zeros_like(theta)
+        
+        if torch.any(torch.abs(theta) > solver_params[1]):
+            for _ in range(solver_params[0]):
+                # Newton-Raphson following implementation in https://github.com/VladyslavUsenko/basalt-headers
+                theta2 = theta.mul(theta)
+
+                func = self.dist_params[3] * theta2
+                func += self.dist_params[2]
+                func = func.mul(theta2)
+                func += self.dist_params[1]
+                func = func.mul(theta2)
+                func += self.dist_params[0]
+                func = func.mul(theta2)
+                func += 1.0
+                func = func.mul(theta)
+
+                d_func_d_theta = 9 * self.dist_params[3] * theta2
+                d_func_d_theta += 7 * self.dist_params[2]
+                d_func_d_theta = d_func_d_theta.mul(theta2)
+                d_func_d_theta += 5 * self.dist_params[1]
+                d_func_d_theta = d_func_d_theta.mul(theta2)
+                d_func_d_theta += 3 * self.dist_params[0]
+                d_func_d_theta = d_func_d_theta.mul(theta2)
+                d_func_d_theta += 1.0
+                # theta += (r_theta - func) / d_func_d_theta
+                theta_fix = (func - r_theta) / d_func_d_theta
+
+                # # Newton-Raphson following implementation in OpenCV
+                # theta2 = theta.mul(theta)
+                # theta4 = theta2.mul(theta2)
+                # theta6 = theta4.mul(theta2)
+                # theta8 = theta6.mul(theta2)
+                # k0_theta2 = self.dist_params[0] * theta2
+                # k1_theta4 = self.dist_params[1] * theta4
+                # k2_theta6 = self.dist_params[2] * theta6
+                # k3_theta8 = self.dist_params[3] * theta8
+                # theta_fix = (theta * (1 + k0_theta2 + k1_theta4 + k2_theta6 + k3_theta8) - r_theta) / (1.0 + 3*k0_theta2 + 5*k1_theta4 + 7*k2_theta6 + 9*k3_theta8)
+
+                theta = theta - torch.where(torch.abs(theta_fix) < solver_params[1], torch.tensor(0.0, device=theta.device), theta_fix)
+                
+                if torch.all(torch.abs(theta_fix) < solver_params[1]):
+                    break
+        return theta, theta_fix
+    
+    
+    def __unproject(self, uv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Unprojects 2D image coordinates to 3D unit sphere coordinates using the Kannala-Brandt camera model. There are two different ways of unprojection to the unit sphere:
+            - A perspective projection with a focal distance of 1 is used to project points on the unit sphere (see fisheye model of OpenCV).
+            - The Kannala-Brandt model is used to unproject points on the unit sphere (see basalt-headers: https://github.com/VladyslavUsenko/basalt-headers)
+        Independent of the method, for the generation of the validity mask, flipping of theta and the convergence rate of the solver (if not smaller as self.unproj_crit[2] pixel invalid) is considered.
+        Args:
+            uv (torch.Tensor | NDArray): 2D image coordinates as a tensor or numpy array with shape (N, 2).
+            use_perspective_reproj (bool, optional): Whether to use perspective reprojection. Defaults to True.
+            solver_params (tuple[int, float], optional): A tuple containing the maximum number of iterations and the convergence threshold for the solver. Default is (10, 1e-8).
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            - points (torch.Tensor): 3D coordinates on the unit sphere with shape (N, 3).
+            - valid (torch.Tensor): Validity mask indicating which points are valid (N,).
+            - theta (torch.Tensor): Incident angles for each of the points on the unit sphere (N, 1).
+        """
+        m_xy = (uv - self.principal * self.matching_scale) / (self.fl * self.matching_scale)
+
+        r_theta = torch.sqrt(torch.sum(m_xy**2, dim=-1, keepdim=True))
+
+        # OpenCV only supports cams with theta in range [-pi/2, pi/2] and since r_theta is used to initialize solver for theta,
+        # it needs to be restricted to the same range. Moreover, since r_theta is a radius, it is always positive.
+        if self.use_perspective_reproj:
+            r_theta = torch.min(torch.max(torch.zeros_like(r_theta), r_theta), torch.tensor(torch.pi*0.5))
+        theta, theta_residual = self.__solveForTheta(r_theta, (self.unproj_crit[0], self.unproj_crit[1]))
+        
+        # theta[torch.abs(theta_residual) > solver_params[1]] = torch.tensor(torch.nan, device=theta.device, dtype=torch.float64)
+        
+        # OpenCV does not include this term in the source code, but since it only supports cams with theta in range [-pi/2, pi/2],
+        # it is necessary. Otherwise, the scale can get negative (due to tan(theta) is negative if theta>pi/2). A negative scale
+        # results in pixels being projected to the opposite side of the image plane.
+        if self.use_perspective_reproj:
+            theta = torch.min(torch.max(torch.tensor(-torch.pi*0.5), theta), torch.tensor(torch.pi*0.5))
+
+        scale = torch.tan(theta) / r_theta if self.use_perspective_reproj else torch.sin(theta) / r_theta
+
+        # theta_flipped = ((r_theta < 0) & (theta > 0)) | ((r_theta > 0) & (theta < 0))
+        theta_flipped = torch.ne(torch.sign(r_theta), torch.sign(theta))
+
+        m_xy = m_xy * scale
+
+        if self.use_perspective_reproj:
+            # assume z = 1 (focal length = 1) and reproject to unit sphere
+            m_z = torch.ones_like(m_xy[..., 0]).unsqueeze(-1)
+        else:
+            m_z = torch.cos(theta)
+        
+        points = torch.cat([m_xy, m_z], dim=-1)
+        points = points / torch.sqrt(torch.sum(points**2, dim=-1, keepdim=True))
+        
+        valid = torch.logical_and(~theta_flipped, torch.abs(theta_residual) < self.unproj_crit[2])
+
+        # points[~valid] = torch.tensor([torch.nan, torch.nan, torch.nan], device=uv.device, dtype=torch.float64)
+
+        return points, valid[..., 0], theta
+
+
+    def __project(self, point: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # OpenCV uses a perspective reprojection with I (identity) as camera matrix to obtain the normalized undistorted image coordinates
+        if  self.use_perspective_reproj:
+            # To avoid the mirroring along the center of the image, the absolute value of z is used (z can be positive or negative)
+            uv = point[..., :2] / torch.abs(point[..., 2]).unsqueeze(-1)
+            # If setting z = 1, the theta angle is always positive. For atan2 to work, the sign of z of the actual point needs to be considered as well.
+            z = torch.sign(point[..., 2]).unsqueeze(-1)
+            # z = torch.ones_like(uv[..., 0]).unsqueeze(-1)
+        else:
+            uv = point[..., :2]
+            z = point[..., 2].unsqueeze(-1)
+
+        r = torch.sqrt(uv[..., 0]**2 + uv[..., 1]**2).unsqueeze(-1)
+
+        theta = torch.atan2(r, z)
+        theta2 = theta.mul(theta)
+
+        r_theta = self.dist_params[3] * theta2
+        r_theta += self.dist_params[2]
+        r_theta = r_theta.mul(theta2)
+        r_theta += self.dist_params[1]
+        r_theta = r_theta.mul(theta2)
+        r_theta += self.dist_params[0]
+        r_theta = r_theta.mul(theta2)
+        r_theta += 1.0
+        r_theta = r_theta.mul(theta)
+        
+        # # OpenCV is not using Horner Schema
+        # theta3 = theta2.mul(theta)
+        # theta4 = theta2.mul(theta2)
+        # theta5 = theta4.mul(theta)
+        # theta6 = theta3.mul(theta3)
+        # theta7 = theta6.mul(theta)
+        # theta8 = theta4.mul(theta4)
+        # theta9 = theta8.mul(theta)
+        # r_theta = theta + self.dist_params[0] * theta3 + self.dist_params[1] * theta5 + self.dist_params[2] * theta7 + self.dist_params[3] * theta9
+
+        valid = torch.ones_like(r, dtype=torch.bool)
+        
+        if self.use_perspective_reproj:
+            invr = torch.where(r > self.proj_crit, 1.0/r, 1.0)
+        else:
+            invr = torch.where(r > self.proj_crit, 1.0/r, torch.where(torch.abs(z) > self.proj_crit, 1.0/z, 1.0))
+            valid = torch.logical_and(valid, torch.logical_or(r > self.proj_crit, torch.abs(z) > self.proj_crit))
+        
+        cdist = r_theta * invr
+        uv = (uv * cdist) * self.fl * self.matching_scale + self.principal * self.matching_scale
+
+        return uv, valid[..., 0], theta
+
+
+    def __calculateFoV(self):
+        xc = self.principal[0] * self.matching_scale[0]
+        yc = self.principal[1] * self.matching_scale[1]
+        width = self.original_resolution[0] * self.matching_scale[0]
+        height = self.original_resolution[1] * self.matching_scale[1]
+
+        pts_ext_h = torch.tensor([[0.5, yc], [width-0.5, yc]], device=self.device)
+        pts_ext_v = torch.tensor([[xc, 0.5], [xc, height-0.5]], device=self.device)
+        # set max theta to maximum since __unproject uses it to estimate valid points
+        undist_pts_ext_h, valid_h, theta_h = self.__unproject(pts_ext_h)
+        undist_pts_ext_v, valid_v, theta_v = self.__unproject(pts_ext_v)
+
+        if torch.any(~valid_h) or torch.any(~valid_v):
+            logger.warning(f'Invalid points detected while calculating max FoV, using default max theta ({self.max_theta}) to calculate FoV')
+            fov = self.max_theta * 2.0
+            logger.info(f'max FoV set to: horizontal: {np.rad2deg(fov)}, vertical: {np.rad2deg(fov)}')
+            return torch.tensor([fov, fov], device=self.device)
+        
+        fov_h = torch.sum(theta_h)
+        fov_v = torch.sum(theta_v)
+        
+        logger.info(f'max FoV calculated: horizontal: {torch.rad2deg(fov_h)}, vertical: {torch.rad2deg(fov_v)}')
+        return torch.tensor([fov_h, fov_v], device=self.device)
 
 
 def parse_json_calib(raw_calibration, matching_resolution, device)->list[CamModel]:
@@ -291,7 +524,7 @@ def parse_json_calib(raw_calibration, matching_resolution, device)->list[CamMode
     return cam_models
 
 
-def parse_json_calib_cv(file_path, matching_resolution, device, max_theta=2.0*np.pi) -> list[CamModel]:
+def parse_json_calib_cv(file_path, matching_resolution, use_perspective_reproj, device, max_theta=np.pi, recalculate_fov=False) -> list[CamModel]:
     fs_config = cv2.FileStorage(file_path, cv2.FILE_STORAGE_READ)
 
     num_cams = int(fs_config.getNode('nb_camera').real())
@@ -349,10 +582,12 @@ def parse_json_calib_cv(file_path, matching_resolution, device, max_theta=2.0*np
     #     pose[:3, 3] += t_center.flatten()
 
     cam_models = []
-    for image_size, cam_matrix, dist_params, rt in zip(
+    for image_size, cam_matrix, dist_params, pose in zip(
         image_sizes, cam_matrices, cam_distortions, poses, strict=True
     ):
         original_resolution = torch.tensor(image_size)
+        rt = torch.tensor(pose, device=device, dtype=torch.float32)
+        # rt[:3, 3] *= 0.001 # convert from mm to m
         cam_models.append(
             CVFisheyeModel(
                 original_resolution,
@@ -368,8 +603,10 @@ def parse_json_calib_cv(file_path, matching_resolution, device, max_theta=2.0*np
                     device=device,
                     dtype=torch.float32,
                 ),
+                use_perspective_reproj,
                 device,
                 max_theta,
+                recalculate_fov
             )
         )
 
