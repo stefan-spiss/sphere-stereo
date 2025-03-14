@@ -31,63 +31,78 @@ Please refer to license.txt for more details.
 
 typedef unsigned char uchar;
 
-inline __device__ float length(float3 a)
+inline __device__ float length(const float3 &a)
 {
     return norm3df(a.x, a.y, a.z);
 }
 
-inline __device__ float3 operator*(float b, float3 a)
+inline __device__ float3 operator*(float b, const float3 &a)
 {
     return make_float3(a.x * b, a.y * b, a.z * b);
 }
 
-inline __device__ float3 operator+(float3 a, float3 b)
+inline __device__ float3 operator*(const float3 &a, float b)
+{
+    return b * a;
+}
+
+inline __device__ float3 operator+(const float3 &a, const float3 &b)
 {
     return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
 
-inline __device__ float3 operator-(float3 a, float3 b)
+inline __device__ float3 operator-(const float3 &a, const float3 &b)
 {
     return make_float3(a.x - b.x, a.y - b.y, a.z - b.z);
 }
 
-inline __device__ float3 operator/(float3 a, float b)
+inline __device__ float3 operator/(const float3 &a, float b)
 {
 	float den = 1.f / b;
 	return make_float3(a.x * den, a.y * den, a.z * den);
 }
 
-inline __device__ float length(float2 a)
+inline __device__ float length(const float2 &a)
 {
 	return hypotf(a.x, a.y);
 }
 
-inline __device__ float dot(float2 a, float2 b)
+inline __device__ float dot(const float2 &a, const float2 &b)
 {
     return a.x * b.x + a.y * b.y;
 }
 
-inline __device__ float2 operator*(float2 a, float2 b)
+inline __device__ float2 operator*(const float2 &a, const float2 &b)
 {
     return make_float2(a.x * b.x, a.y * b.y);
 }
 
-inline __device__ float2 operator+(float2 a, float2 b)
+inline __device__ float2 operator*(float b, const float2 &a)
+{
+    return make_float2(a.x * b, a.y * b);
+}
+
+inline __device__ float2 operator*(const float2 &a, float b)
+{
+    return b * a;
+}
+
+inline __device__ float2 operator+(const float2 &a, const float2 &b)
 {
     return make_float2(a.x + b.x, a.y + b.y);
 }
 
-inline __device__ float2 operator-(float2 a, float2 b)
+inline __device__ float2 operator-(const float2 &a, const float2 &b)
 {
     return make_float2(a.x - b.x, a.y - b.y);
 }
 
-inline __device__ float2 operator/(float2 a, float2 b)
+inline __device__ float2 operator/(const float2 &a, const float2 &b)
 {
     return make_float2(a.x / b.x, a.y / b.y);
 }
 
-inline __device__ float2 operator/(float2 a, float b)
+inline __device__ float2 operator/(const float2 &a, float b)
 {
     float den = 1.f / b;
     return make_float2(a.x * den, a.y * den);
@@ -108,12 +123,12 @@ inline __device__ float3 uchar3Tofloat3(uchar3 a)
     return make_float3((float)(a.x), (float)(a.y), (float)(a.z));
 }
 
-inline __device__ uchar3 float3Touchar3(float3 a)
+inline __device__ uchar3 float3Touchar3(const float3 &a)
 {
     return make_uchar3((uchar)(a.x), (uchar)(a.y), (uchar)(a.z));
 }
 
-inline __device__ float absSum(float3 a)
+inline __device__ float absSum(const float3 &a)
 {
 	return fabs(a.x) + fabs(a.y) + fabs(a.z);
 }
