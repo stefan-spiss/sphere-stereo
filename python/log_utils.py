@@ -4,7 +4,7 @@
 import logging
 import sys
 
-__logger = logging.getLogger('omnimvs')
+__logger = logging.getLogger('sphere-stereo')
 LOG_INFO = __logger.info
 LOG_ERROR = __logger.error
 LOG_WARNING = __logger.warning
