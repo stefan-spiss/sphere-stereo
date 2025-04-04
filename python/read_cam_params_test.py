@@ -1,18 +1,21 @@
 import argparse
 import json
+import math
 import os.path
 
+import cupy
 import cv2
 import numpy as np
 import open3d as o3
 import torch
 from joblib import Parallel, delayed
-from log_utils import LOG_DEBUG, LOG_WARNING, initLogging
+from log_utils import LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_WARNING, initLogging
 from utils import (
     CamModel,
     parse_json_calib,
-    parse_json_calib_cv,
+    parse_json_calib_kb_fisheye,
     read_input_images,
+    translation,
 )
 
 
@@ -120,16 +123,120 @@ def getPanoramasInputImgs(imgs, cams: list[CamModel], rays, equirect_size):
         P2 = transformRays(rays, cam.rt.inverse())
         # LOG_DEBUG(f'P2_shape: {P2.shape}')
         p, valid = cam.project(P2)
+        LOG_DEBUG(f'p_shape: {p.shape}')
+        grid = pixelToGrid(p, equirect_size, cam.original_resolution * cam.matching_scale)
+        LOG_DEBUG(f'grid_shape: {grid.shape}')
+        # valid = (theta <= cam.max_theta).reshape(self.equirect_size)
+        valid = valid.reshape((equirect_size[1], equirect_size[0])).detach().cpu().numpy()
+        LOG_DEBUG(f'valid_shape: {valid.shape}')
+
+        img_tensor = torch.tensor(img, device=grid.device).permute(2, 0, 1).unsqueeze(0)
+        LOG_DEBUG(f'img_tensor_shape: {img_tensor.shape}')
+        equi_img = interp2D(img_tensor, grid).detach().cpu().numpy()
+        LOG_DEBUG(f'equi_img_shape: {equi_img.shape}')
+        if is_rgb:
+            equi_img = np.moveaxis(equi_img, 0, -1)
+            pano = np.zeros((equirect_size[1], equirect_size[0], 3))
+        else:
+            pano = np.zeros((equirect_size[1], equirect_size[0]))
+        pano[valid] = equi_img[valid]
+        panos.append(pano.astype(np.uint8))
+    return panos
+
+def getPanoramasInputImgsCupy(imgs, cams: list[CamModel], equirect_size):
+    panos = []
+    
+    with open('python/vec_utils.cuh') as f:
+        utils_source = f.read()
+    
+    with open('python/utils.cuh') as f:
+        utils_source = utils_source + f.read()
+        
+    with open('python/kb_fisheye.cuh') as f:
+        cuda_source = utils_source + f.read()
+
+    with open('python/reprojection.cu') as f:
+        cuda_source = cuda_source + f.read()
+        cuda_source = cuda_source.replace("MAX_ITER", str(cams[0].unproj_crit[0]))
+        cuda_source = cuda_source.replace("UNPROJ_CRIT_0", str(cams[0].unproj_crit[1]))
+        cuda_source = cuda_source.replace("UNPROJ_CRIT_1", str(cams[0].unproj_crit[2]))
+        cuda_source = cuda_source.replace("MIN_LIMIT", str(cams[0].proj_crit))
+
+        cuda_source = cuda_source.replace("PANO_COLS", str(equirect_size[0]))
+        cuda_source = cuda_source.replace("PANO_ROWS", str(equirect_size[1]))
+        cuda_source = cuda_source.replace("COLS", str(cams[0].original_resolution[0].item()))
+        cuda_source = cuda_source.replace("ROWS", str(cams[0].original_resolution[1].item()))
+        cuda_source = cuda_source.replace("REFERENCES_COUNT", str(len(cams)))
+
+
+    LOG_DEBUG(f"Cuda source:\n{cuda_source}")
+
+    kernel_names = ['reprojectToPanorama']
+    ext = '<FisheyeKB>' if not cam_models[0].use_perspective_reproj else '<FisheyeKBPerspectiveProjection>'
+    for i in range(len(kernel_names)):
+        kernel_names[i] += ext
+
+    try:
+        # module = cupy.RawModule(code=cuda_source, options=("-std=c++11", "-Xptxas"))
+        # module = cupy.RawModule(code=cuda_source, options=("-std=c++11", "-rdc=true"))
+        module = cupy.RawModule(code=cuda_source, options=("-std=c++11",), name_expressions=kernel_names)
+        module.compile()
+        LOG_INFO("CUDA compilation successful")
+    except cupy.cuda.compiler.CompileException as e:
+        LOG_ERROR(f"Compilation failed: {e}")
+        raise e
+
+    reprojection_fct = module.get_function(kernel_names[0])
+    
+    pano_lookup= torch.zeros([len(cams), equirect_size[1], equirect_size[0], 2], device='cuda:0')
+    valid_lookup = torch.zeros([len(cams), equirect_size[1], equirect_size[0]], dtype=torch.bool, device='cuda:0')
+    calibration_vectors = []
+    translation_vectors = []
+    rotation_vectors = []
+    for cam in cams:
+        calibration_vectors.append(cam.vectorize_calibration())
+        inv_rt = cam.rt.inverse()
+        translation_vectors.append(inv_rt[:3, 3])
+        rotation_vectors.append(inv_rt[:3, :3])
+
+    calibration_vectors = torch.cat(calibration_vectors, dim=0).contiguous()
+    translations = torch.cat(translation_vectors, dim=0).contiguous()
+    rotations = torch.cat(rotation_vectors, dim=0).contiguous()
+    
+    block_size = 256
+    grid_size = math.ceil((equirect_size[0] * equirect_size[1]) / block_size)
+    
+    LOG_DEBUG(f'block_size: {block_size}, grid_size: {grid_size}')
+    
+    reprojection_fct(
+        block=(block_size,), grid=(grid_size,),
+        args=(
+            pano_lookup.data_ptr(),
+            valid_lookup.data_ptr(),
+            calibration_vectors.data_ptr(),
+            rotations.data_ptr(),
+            translations.data_ptr()
+        )
+    )
+    # cupy.cuda.get_current_stream().synchronize()
+    
+    for cam, img, pano_lut, valid in zip(cams, imgs, pano_lookup, valid_lookup, strict=True):
+        is_rgb = len(img.shape) == 3
+        # img[cam.invalid_mask] *= 0
+
         # LOG_DEBUG(f'p_shape: {p.shape}')
+        p_vis = pano_lut.cpu().numpy()
+        p = pano_lut.reshape((equirect_size[1] * equirect_size[0], 2))
         grid = pixelToGrid(p, equirect_size, cam.original_resolution * cam.matching_scale)
         # LOG_DEBUG(f'grid_shape: {grid.shape}')
         # valid = (theta <= cam.max_theta).reshape(self.equirect_size)
-        valid = valid.reshape((equirect_size[1], equirect_size[0])).detach().cpu().numpy()
+        # valid = valid_lookup.reshape((equirect_size[1], equirect_size[0]).get())
+        valid = valid.cpu().numpy()
         # LOG_DEBUG(f'valid_shape: {valid.shape}')
 
         img_tensor = torch.tensor(img, device=grid.device).permute(2, 0, 1).unsqueeze(0)
         # LOG_DEBUG(f'img_tensor_shape: {img_tensor.shape}')
-        equi_img = interp2D(img_tensor, grid).detach().cpu().numpy()
+        equi_img = interp2D(img_tensor, grid).cpu().numpy()
         # LOG_DEBUG(f'equi_img_shape: {equi_img.shape}')
         if is_rgb:
             equi_img = np.moveaxis(equi_img, 0, -1)
@@ -149,15 +256,16 @@ if __name__ == "__main__":
     # parser.add_argument('--min_dist', type=float, default=0.55)
     # parser.add_argument('--max_dist', type=float, default=100)
     parser.add_argument('--device', type=str, default="cuda:0")
-    parser.add_argument('--cv_fisheye', type=bool, default=False)
+    parser.add_argument('--kb_fisheye', type=bool, default=False)
+    parser.add_argument('--use_cupy', type=bool, default=False)
     args = parser.parse_args()
     
-    initLogging("DEBUG")
+    initLogging()
 
-    if args.cv_fisheye:
+    if args.kb_fisheye:
         use_perspective_reproj = False
         recalculate_fov = True
-        cam_models = parse_json_calib_cv(os.path.join(args.dataset_path, "calibrated_cameras_data.yml"), args.matching_resolution, use_perspective_reproj, args.device, np.pi, recalculate_fov)
+        cam_models = parse_json_calib_kb_fisheye(os.path.join(args.dataset_path, "calibrated_cameras_data.yml"), args.matching_resolution, use_perspective_reproj, args.device, np.pi / 2.0, recalculate_fov)
     else:
         f = open(os.path.join(args.dataset_path, "calibration.json"))
         raw_calibration = json.load(f)['value0']
@@ -166,7 +274,8 @@ if __name__ == "__main__":
     # Reference viewpoint for the estimated RGB-D panorama is the center of the references
     reprojection_viewpoint = torch.zeros([3], device=args.device)
     for cam in cam_models:
-        cam.rt[:3, 3] *= 0.001
+        if args.kb_fisheye:
+            cam.rt[:3, 3] *= 0.001
         reprojection_viewpoint += cam.rt[:3, 3]
     reprojection_viewpoint /= len(cam_models)
 
@@ -174,11 +283,11 @@ if __name__ == "__main__":
         cam.rt[:3, 3] -= reprojection_viewpoint
     
     cam_centers = []
-    cam_centers.append(o3.geometry.TriangleMesh.create_coordinate_frame(size=5))
+    cam_centers.append(o3.geometry.TriangleMesh.create_coordinate_frame(size=0.15))
     for i, cam in enumerate(cam_models):
         rt = cam.rt.cpu().numpy()
         # rt[:3, 3] *= (1 / args.min_dist - 1 / args.max_dist)
-        cam_centers.append(o3.geometry.TriangleMesh.create_coordinate_frame(size=10.0).transform(rt))
+        cam_centers.append(o3.geometry.TriangleMesh.create_coordinate_frame(size=0.1).transform(rt))
         if i == 0:
             cam_centers[-1].paint_uniform_color([1, 0, 0])
         elif i == 1:
@@ -187,10 +296,10 @@ if __name__ == "__main__":
     o3.visualization.draw_geometries(cam_centers)
     
     filenames = os.listdir(os.path.join(args.dataset_path, "cam0/"))
-    try:
+    from contextlib import suppress
+
+    with suppress(ValueError):
         filenames.remove("mask.png")
-    except ValueError:
-        pass  # mask is not mandatory
 
     all_fisheye_images = Parallel(n_jobs=-1, backend="threading")(
         delayed(read_input_images)(
@@ -198,8 +307,11 @@ if __name__ == "__main__":
             cam_models, range(len(cam_models))) 
         for filename in filenames)
 
-    rays = makeSphericalRays(args.panorama_resolution, args.device, 90.0)
-    panos = getPanoramasInputImgs(all_fisheye_images[0]['images_to_match'], cam_models, rays, args.panorama_resolution)
+    if args.use_cupy and args.kb_fisheye:
+        panos = getPanoramasInputImgsCupy(all_fisheye_images[0]['images_to_match'], cam_models, args.panorama_resolution)
+    else:
+        rays = makeSphericalRays(args.panorama_resolution, args.device, 90.0)
+        panos = getPanoramasInputImgs(all_fisheye_images[0]['images_to_match'], cam_models, rays, args.panorama_resolution)
 
     vis_pano_img = np.concatenate([img for img in panos], axis=0)
     cv2.namedWindow('pano_imgs', cv2.WINDOW_NORMAL)

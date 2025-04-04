@@ -28,24 +28,21 @@ Warranty: KAIST-VCLAB MAKES NO REPRESENTATIONS OR WARRANTIES ABOUT THE SUITABILI
 Please refer to license.txt for more details.
 =======================================================================
 """
-import logging
 import math
 import os.path
 
 # import sys
-import sys
-import warnings
 from abc import ABC, abstractmethod
 
 import cv2
 import numpy as np
 import torch
-from log_utils import setupLogger
+from log_utils import __default_log_level, setupLogger
 from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation as R
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
-logger = setupLogger(__name__, logging.DEBUG)
+logger = setupLogger(__name__, __default_log_level)
 
 class CamModel(ABC):
     def __init__(self, model: str, original_resolution: torch.Tensor, rt: torch.Tensor, matching_scale: torch.Tensor, device: torch.device | str ='cpu'):
@@ -135,7 +132,7 @@ class DoubleSphereModel(CamModel):
         return calibration_vector
 
 
-class CVFisheyeModel(CamModel):
+class KBFisheyeModel(CamModel):
     def __init__(
         self,
         original_resolution: torch.Tensor,
@@ -155,8 +152,7 @@ class CVFisheyeModel(CamModel):
             1e-6
         ),
     ):
-        
-        super().__init__('cv_fisheye', original_resolution, rt, matching_scale, device)
+        super().__init__('kb_fisheye', original_resolution, rt, matching_scale, device)
         self.principal = principal
         self.fl = fl
         self.dist_params = dist_params
@@ -192,16 +188,6 @@ class CVFisheyeModel(CamModel):
         # points[~valid[..., 0]] = torch.tensor([torch.nan, torch.nan, torch.nan], device=uv.device)
         return points, valid[..., 0]
     
-    def k(self):
-        fl = (self.fl * self.matching_scale).cpu().numpy()
-        principal = (self.principal * self.matching_scale).cpu().numpy()
-        # logger.debug(np.array([[fl[0], 0, principal[0]], [0, fl[1], principal[1]], [0., 0., 1.]]).astype(np.float32))
-        return np.array([[fl[0], 0, principal[0]], [0, fl[1], principal[1]], [0., 0., 1.]]).astype(np.float32)
-
-    def d(self):
-        dist_params = self.dist_params.cpu().numpy()
-        return dist_params.astype(np.float32)
-
     def project(self, point: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Projects a 3D point onto a 2D plane using fisheye distortion parameters.
@@ -212,69 +198,19 @@ class CVFisheyeModel(CamModel):
                 - uv (torch.Tensor): A tensor of shape (..., 2) representing the 2D projected points.
                 - valid (torch.Tensor): A boolean tensor of shape (...) indicating whether each point is within the valid range.
         """
-
         uv, valid, theta = self.__project(point)
         valid = torch.logical_and(valid.unsqueeze(-1), theta <= self.max_theta)
         # uv[~valid[..., 0]] = torch.tensor([torch.nan, torch.nan], device=point.device)
-        
         return uv, valid[..., 0]
         
-        # logger.debug(f'cvfisheye project: shape in: {point.shape}')
-
-        # # norm = torch.linalg.norm(point, dim=-1, keepdim=True) + 1e-8
-        # # theta = torch.arctan2(-point[..., 2], norm)
-        # # theta = theta + torch.tensor(np.pi / 2, device=point.device)
-
-        # uv = point[..., :2] / point[..., 2].unsqueeze(-1)
-        # r = torch.norm(point, dim=-1, keepdim=True)
-        # theta = torch.atan(r)
-        # theta2 = theta.mul(theta)
-        # theta3 = theta2.mul(theta)
-        # theta4 = theta2.mul(theta2)
-        # theta5 = theta4.mul(theta)
-        # theta6 = theta3.mul(theta3)
-        # theta7 = theta6.mul(theta)
-        # theta8 = theta4.mul(theta4)
-        # theta9 = theta8.mul(theta)
-
-        # theta_d = theta + self.dist_params[0] * theta3 + self.dist_params[1] * theta5 + self.dist_params[2] * theta7 + self.dist_params[3] * theta9
-
-        # invr = torch.where(r > 1e-8, 1.0/r, 1.0)
-        # cdist = torch.where(r > 1e-8, theta_d * invr, 1.0)
-
-        # uv = (uv * cdist) * self.fl * self.matching_scale + self.principal * self.matching_scale
-        # valid = torch.where(theta > self.max_theta, False, True)
-        # uv[~valid[..., 0]] = torch.tensor([torch.nan, torch.nan], device=point.device)
-
-        # logger.debug(f'cvfisheye project: shape out: uv: {uv.shape}, valid: {valid.shape}')
-        # # return uv, valid[..., 0]
-        
-        # points = point.detach().squeeze().cpu().numpy()
-        # norm = np.sqrt(points[..., 0]**2 + points[..., 1]**2) + sys.float_info.epsilon
-        # theta = np.arctan2(-points[..., 2], norm)
-        # theta = theta + np.pi / 2
-        # # convert points from (n, 3) to (n, 1, 3)
-        # points = points.reshape(-1, 1, 3)
-        # distorted_points, _ = cv2.fisheye.projectPoints(points, np.zeros((3, 1)), np.zeros((3, 1)), self.k(), self.d())
-        # new_shape = list(point.shape[:-1])
-        # new_shape.append(2)
-        # distorted_points = distorted_points.reshape(new_shape)
-        # distorted_points[theta.squeeze() > self.max_theta, :] = np.nan
-        # return torch.tensor(distorted_points, device=point.device), torch.tensor(theta.squeeze() <= self.max_theta, device=point.device).unsqueeze(0)
-
-        # uv_cv = torch.tensor(distorted_points, device=point.device)
-        # diff = uv-uv_cv
-        # diff_large = torch.where(torch.abs(diff) > 0.01, True, False)
-
-        # return uv, valid[..., 0]
-
     def vectorize_calibration(self):
         """
-        Convert the intrinsics into a continuous float vector that follows the Intrinsics' structure
-        (See stitcher.cu for Intrinsics' definition)
+        Convert the intrinsics into a continuous float vector that follows the Intrinsics' structure(See stitcher_cv.cu for Intrinsics' definition)
         Scale the focal length and the principal point using the matching scale.
+        Needs to take memory alignment of CUDA into account. Since the dist_params are stored as a float4 in CUDA, the whole struct is aligned to a multiple of 16 bytes.
+        As a result, the size of the calibration_vector tensor needs to be a multiple of 16 bytes and therefore needs to have a size of 12 floats (12 * 4 bytes = 48 bytes).
         """
-        calibration_vector = torch.zeros([9], device=self.device)
+        calibration_vector = torch.zeros([12], device=self.device)
         calibration_vector[0:2] = self.fl * self.matching_scale
         calibration_vector[2:4] = self.principal * self.matching_scale
         calibration_vector[4:8] = self.dist_params
@@ -366,7 +302,6 @@ class CVFisheyeModel(CamModel):
         if self.use_perspective_reproj:
             r_theta = torch.min(torch.max(torch.zeros_like(r_theta), r_theta), torch.tensor(torch.pi*0.5))
         theta, theta_residual = self.__solveForTheta(r_theta, (self.unproj_crit[0], self.unproj_crit[1]))
-        
         # theta[torch.abs(theta_residual) > solver_params[1]] = torch.tensor(torch.nan, device=theta.device, dtype=torch.float64)
         
         # OpenCV does not include this term in the source code, but since it only supports cams with theta in range [-pi/2, pi/2],
@@ -377,7 +312,6 @@ class CVFisheyeModel(CamModel):
 
         scale = torch.tan(theta) / r_theta if self.use_perspective_reproj else torch.sin(theta) / r_theta
 
-        # theta_flipped = ((r_theta < 0) & (theta > 0)) | ((r_theta > 0) & (theta < 0))
         theta_flipped = torch.ne(torch.sign(r_theta), torch.sign(theta))
 
         m_xy = m_xy * scale
@@ -392,7 +326,6 @@ class CVFisheyeModel(CamModel):
         points = points / torch.sqrt(torch.sum(points**2, dim=-1, keepdim=True))
         
         valid = torch.logical_and(~theta_flipped, torch.abs(theta_residual) < self.unproj_crit[2])
-
         # points[~valid] = torch.tensor([torch.nan, torch.nan, torch.nan], device=uv.device, dtype=torch.float64)
 
         return points, valid[..., 0], theta
@@ -445,6 +378,13 @@ class CVFisheyeModel(CamModel):
         
         cdist = r_theta * invr
         uv = (uv * cdist) * self.fl * self.matching_scale + self.principal * self.matching_scale
+        # if r.shape[1] * r.shape[2] == int((self.original_resolution[1] * self.matching_scale[1]).item()) * int((self.original_resolution[0] * self.matching_scale[0]).item()):
+        #     point_vis = point[0, ...].reshape((int((self.original_resolution[1] * self.matching_scale[1]).item()), int((self.original_resolution[0] * self.matching_scale[0]).item()), point.shape[3])).cpu().numpy()
+        #     r_vis = r[0, ...].clone().reshape((int((self.original_resolution[1] * self.matching_scale[1]).item()), int((self.original_resolution[0] * self.matching_scale[0]).item()), r.shape[3])).cpu().numpy()
+        #     z_vis = z[0, ...].clone().reshape((int((self.original_resolution[1] * self.matching_scale[1]).item()), int((self.original_resolution[0] * self.matching_scale[0]).item()), z.shape[3])).cpu().numpy()
+        #     uv_vis = uv[0, ...].clone().reshape((int((self.original_resolution[1] * self.matching_scale[1]).item()), int((self.original_resolution[0] * self.matching_scale[0]).item()), uv.shape[3])).cpu().numpy()
+        #     theta_vis = theta[0, ...].clone().reshape((int((self.original_resolution[1] * self.matching_scale[1]).item()), int((self.original_resolution[0] * self.matching_scale[0]).item()), theta.shape[3])).cpu().numpy()
+        #     valid_vis = valid[0, ...].clone().reshape((int((self.original_resolution[1] * self.matching_scale[1]).item()), int((self.original_resolution[0] * self.matching_scale[0]).item()), valid.shape[3])).cpu().numpy().astype(bool)
 
         return uv, valid[..., 0], theta
 
@@ -458,8 +398,8 @@ class CVFisheyeModel(CamModel):
         pts_ext_h = torch.tensor([[0.5, yc], [width-0.5, yc]], device=self.device)
         pts_ext_v = torch.tensor([[xc, 0.5], [xc, height-0.5]], device=self.device)
         # set max theta to maximum since __unproject uses it to estimate valid points
-        undist_pts_ext_h, valid_h, theta_h = self.__unproject(pts_ext_h)
-        undist_pts_ext_v, valid_v, theta_v = self.__unproject(pts_ext_v)
+        _, valid_h, theta_h = self.__unproject(pts_ext_h)
+        _, valid_v, theta_v = self.__unproject(pts_ext_v)
 
         if torch.any(~valid_h) or torch.any(~valid_v):
             logger.warning(f'Invalid points detected while calculating max FoV, using default max theta ({self.max_theta}) to calculate FoV')
@@ -524,7 +464,7 @@ def parse_json_calib(raw_calibration, matching_resolution, device)->list[CamMode
     return cam_models
 
 
-def parse_json_calib_cv(file_path, matching_resolution, use_perspective_reproj, device, max_theta=np.pi, recalculate_fov=False) -> list[CamModel]:
+def parse_json_calib_kb_fisheye(file_path, matching_resolution, use_perspective_reproj, device, max_theta=np.pi, recalculate_fov=False) -> list[CamModel]:
     fs_config = cv2.FileStorage(file_path, cv2.FILE_STORAGE_READ)
 
     num_cams = int(fs_config.getNode('nb_camera').real())
@@ -552,7 +492,7 @@ def parse_json_calib_cv(file_path, matching_resolution, use_perspective_reproj, 
             raise ValueError(
                 f'Only fisheye cameras are supported. Camera {i} is not a fisheye camera.'
             )
-        models.append('cvfisheye')
+        models.append('kb_fisheye')
         cam_matrices.append(cam_cfg.getNode('camera_matrix').mat())
         cam_distortions.append(cam_cfg.getNode('distortion_vector').mat())
         image_sizes.append(
@@ -572,24 +512,14 @@ def parse_json_calib_cv(file_path, matching_resolution, use_perspective_reproj, 
 
         poses.append(cam_cfg.getNode('camera_pose_matrix').mat())
 
-    # t_center = np.zeros((3, 1), poses[0].dtype)
-    # for pose in poses:
-    #     t_center += translation(pose)
-
-    # t_center /= num_cams
-
-    # for pose in poses:
-    #     pose[:3, 3] += t_center.flatten()
-
     cam_models = []
     for image_size, cam_matrix, dist_params, pose in zip(
         image_sizes, cam_matrices, cam_distortions, poses, strict=True
     ):
         original_resolution = torch.tensor(image_size)
         rt = torch.tensor(pose, device=device, dtype=torch.float32)
-        # rt[:3, 3] *= 0.001 # convert from mm to m
         cam_models.append(
-            CVFisheyeModel(
+            KBFisheyeModel(
                 original_resolution,
                 torch.tensor([cam_matrix[0, 2], cam_matrix[1, 2]], device=device, dtype=torch.float32),
                 torch.tensor([cam_matrix[0, 0], cam_matrix[1, 1]], device=device, dtype=torch.float32),
@@ -650,18 +580,17 @@ def read_input_images(filename, dataset_path, matching_resolution, rgb_to_stitch
                 elif image.dtype == np.float32:
                     if np.max(image) > 1:
                         image = np.clip(image, 0, 1)
-                        warnings.warn("Image has out-of-range float values for file " 
-                                      + file_path + ". Clipped for processing.")
+                        logger.warning("Image has out-of-range float values for file " + file_path + ". Clipped for processing.")
                     image = image * 255
                 else:
-                    warnings.warn("Invalide image type for file " + file_path)
+                    logger.warning("Invalide image type for file " + file_path)
                     valid_frame = False
             else:
-                warnings.warn("Invalid image size / channels for file " + file_path)
+                logger.warning("Invalid image size / channels for file " + file_path)
                 valid_frame = False
 
         else:
-            warnings.warn("Cannot read image for file " + file_path)
+            logger.warning("Cannot read image for file " + file_path)
             valid_frame = False
         
         if valid_frame:
@@ -715,11 +644,11 @@ def evaluate_rgbd_panorama(rgbd_panoramas, filename, dataset_path, bad_px_ratio_
 
             return {"ssim": ssim, "psnr": psnr, "mae": mae, "rmse": rmse, "bad_px_ratios": bad_px_ratios}
         else:
-            warnings.warn("Invalid ground truth for file " + filename + ". Will be ignored for evaluation")
+            logger.warning("Invalid ground truth for file " + filename + ". Will be ignored for evaluation")
             return None
 
     except KeyError:
-        warnings.warn("Invalid ground truth for file " + filename)
+        logger.warning("Invalid ground truth for file " + filename)
         return None
 
 def save_rgbd_panorama(rgbd_panoramas, filename, dataset_path):
@@ -727,7 +656,7 @@ def save_rgbd_panorama(rgbd_panoramas, filename, dataset_path):
         rgbd_panorama = rgbd_panoramas[filename]
         save_name = os.path.splitext(filename)[0]
         cv2.imwrite(os.path.join(dataset_path, "output/rgb_" + save_name + ".png"), rgbd_panorama["rgb"])
-        cv2.imwrite(os.path.join(dataset_path, "output/inv_distance_" + save_name + ".exr"), 
+        cv2.imwrite(os.path.join(dataset_path, "output/inv_distance_" + save_name + ".hdr"), 
                     rgbd_panorama["inv_distance"])
     except KeyError:
         pass

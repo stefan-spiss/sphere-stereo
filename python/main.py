@@ -31,6 +31,7 @@ Please refer to license.txt for more details.
 import argparse
 import json
 import os.path
+from contextlib import suppress
 from pathlib import Path
 
 import cv2
@@ -38,45 +39,57 @@ import numpy as np
 import torch
 from depth_estimation import RGBD_Estimator
 from joblib import Parallel, delayed
-from log_utils import initLogging
+from log_utils import LOG_ERROR, __default_log_level, initLogging, setDefaultLoggerLevel
 from utils import (
     evaluate_rgbd_panorama,
     parse_json_calib,
-    parse_json_calib_cv,
+    parse_json_calib_kb_fisheye,
     read_input_images,
     save_rgbd_panorama,
 )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset_path', type=str, default="evaluation_dataset")
-    parser.add_argument('--references_indices', nargs="*", type=int, default=[0, 2])
-    parser.add_argument('--min_dist', type=float, default=0.55)
-    parser.add_argument('--max_dist', type=float, default=100)
-    parser.add_argument('--candidate_count', type=int, default=32)
-    parser.add_argument('--sigma_i', type=float, default=10)
-    parser.add_argument('--sigma_s', type=float, default=25)
-    parser.add_argument('--matching_resolution', nargs=2, type=int, default=[1024, 1024])
-    parser.add_argument('--rgb_to_stitch_resolution', nargs=2, type=int, default=[1216, 1216])
-    parser.add_argument('--panorama_resolution', nargs=2, type=int, default=[2048, 1024])
-    parser.add_argument('--device', type=str, default="cuda:0")
-    parser.add_argument('--saving', type=bool, default=True)
-    parser.add_argument('--visualize', type=bool, default=False)
-    parser.add_argument('--evaluate', type=bool, default=False)
-    parser.add_argument('--bad_px_ratio_thresholds', type=float, default=[0.1, 0.4])
-    parser.add_argument('--cv_fisheye', type=bool, default=False)
-    parser.add_argument('--use_perspective_reproj', type=bool, default=False)
-    parser.add_argument('--recalculate_fov', type=bool, default=True)
+    parser.add_argument('--dataset_path', type=str, default="evaluation_dataset", help="Path to the dataset folder")
+    parser.add_argument('--references_indices', nargs="*", type=int, default=[0, 2], help="Indices of the reference cameras to be used for the RGB-D panorama.")
+    parser.add_argument('--min_dist', type=float, default=0.55, help="Minimum distance of spherical sweeping volume (depends on unit of the camera calibration).")
+    parser.add_argument('--max_dist', type=float, default=100, help="Maximum distance of spherical sweeping volume (depends on unit of the camera calibration).")
+    parser.add_argument('--candidate_count', type=int, default=32, help="Number of depth candidates used for spherical sweeping (number of spheres between min and max distance).")
+    parser.add_argument('--search_steps_min_dist', type=int, default=-1, help="Number of search steps to find minimum valid distance for each pixel in each reference image. If -1, min_dist is used for each pixel.")
+    parser.add_argument('--sigma_i', type=float, default=10, help="Edge preservation parameter for bilateral filter weights used for edge-preserving downsampling (depth estimation).")
+    parser.add_argument('--sigma_s', type=float, default=25, help="Smoothness parameter for gaussian filter weights used for edge-preserving upsampling (depth estimation).")
+    parser.add_argument('--matching_resolution', nargs=2, type=int, default=[1024, 1024], help="Resolution of the input images to be used for matching.")
+    parser.add_argument('--rgb_to_stitch_resolution', nargs=2, type=int, default=[1216, 1216], help="Resolution of the input images to be used for RGB stitching.")
+    parser.add_argument('--panorama_resolution', nargs=2, type=int, default=[2048, 1024], help="Resolution of the output panorama.")
+    parser.add_argument('--device', type=str, default="cuda:0", help="Device to use for computation (e.g., 'cuda:0' or 'cpu').")
+    parser.add_argument('--saving', action=argparse.BooleanOptionalAction, default=True, help="Save the RGB-D panorama to disk.")
+    parser.add_argument('--visualize', action=argparse.BooleanOptionalAction, default=False, help="Visualize the RGB-D panorama.")
+    parser.add_argument('--evaluate', action=argparse.BooleanOptionalAction, default=False, help="Evaluate the RGB-D panorama.")
+    parser.add_argument('--bad_px_ratio_thresholds', type=float, default=[0.1, 0.4], help="Thresholds for bad pixel ratio evaluation.")
+    parser.add_argument('--kb_fisheye', action=argparse.BooleanOptionalAction, default=False, help="Use OpenCV fisheye model.")
+    parser.add_argument('--use_perspective_reproj', action=argparse.BooleanOptionalAction, default=False, help="If kb_fisheye is used, use perspective reprojection in addition to Kannala-Brandt reprojection (as done in OpenCV fisheye model).")
+    parser.add_argument('--recalculate_fov', action=argparse.BooleanOptionalAction, default=True, help="If kb_fisheye is used, recalculate the field of view (FOV) for the fisheye camera model.")
+    parser.add_argument('--max_theta', type=float, default=90, help="If kb_fisheye is used, maximum theta value for the fisheye camera model (in degrees).")
     args = parser.parse_args()
     
-    initLogging("DEBUG")
+    initLogging()
 
-    if args.cv_fisheye:
-        cam_models = parse_json_calib_cv(os.path.join(args.dataset_path, "calibrated_cameras_data.yml"), args.matching_resolution, args.use_perspective_reproj, args.device, np.pi, args.recalculate_fov)
+    if args.kb_fisheye:
+        cam_models = parse_json_calib_kb_fisheye(os.path.join(args.dataset_path, "calibrated_cameras_data.yml"), args.matching_resolution, args.use_perspective_reproj, args.device, np.deg2rad(args.max_theta), args.recalculate_fov)
+
     else:
-        f = open(os.path.join(args.dataset_path, "calibration.json"))
-        raw_calibration = json.load(f)['value0']
-        cam_models = parse_json_calib(raw_calibration, args.matching_resolution, args.device)
+        with open(os.path.join(args.dataset_path, "calibration.json")) as f:
+            raw_calibration = json.load(f)['value0']
+            cam_models = parse_json_calib(raw_calibration, args.matching_resolution, args.device)
+
+    if len(cam_models) < 2:
+        LOG_ERROR("Only one or no camera model found. Please check the calibration file.")
+        raise RuntimeError("Only one or no camera model found. Please check the calibration file.")
+
+    # # Reference viewpoint for the estimated RGB-D panorama is the center of all cameras
+    # reprojection_viewpoint = torch.zeros([3], device=args.device)
+    # for cam in cam_models:
+    #     reprojection_viewpoint += cam.rt[:3, 3] / len(cam_models)
 
     # Reference viewpoint for the estimated RGB-D panorama is the center of the references
     reprojection_viewpoint = torch.zeros([3], device=args.device)
@@ -95,17 +108,16 @@ if __name__ == "__main__":
             masks.append(torch.ones(args.matching_resolution, device=args.device).unsqueeze(0))
 
     # Initialize distance estimator and stitcher
-    rgbd_estimator = RGBD_Estimator(cam_models, args.min_dist, args.max_dist, args.candidate_count, 
+    rgbd_estimator = RGBD_Estimator(cam_models, args.min_dist, args.max_dist, args.candidate_count, args.search_steps_min_dist,
                                     args.references_indices, reprojection_viewpoint, masks, 
                                     args.matching_resolution, args.rgb_to_stitch_resolution, args.panorama_resolution, 
                                     args.sigma_i, args.sigma_s, args.device)
 
 
     filenames = os.listdir(os.path.join(args.dataset_path, "cam0/"))
-    try:
+
+    with suppress(ValueError): # mask is not mandatory
         filenames.remove("mask.png")
-    except ValueError:
-        pass  # mask is not mandatory
 
     all_fisheye_images = Parallel(n_jobs=-1, backend="threading")(
         delayed(read_input_images)(
@@ -166,13 +178,13 @@ if __name__ == "__main__":
                 rmse += evaluation["rmse"]
                 mae += evaluation["mae"]
                 bad_px_ratios = [bad_px_ratio + current_bad_px_ratio 
-                    for  bad_px_ratio, current_bad_px_ratio in zip(bad_px_ratios, evaluation["bad_px_ratios"])]
+                    for  bad_px_ratio, current_bad_px_ratio in zip(bad_px_ratios, evaluation["bad_px_ratios"], strict=True)]
                 evaluation_count += 1
 
         if evaluation_count > 0:
             print("PSNR = ", psnr / evaluation_count)
             print("SSIM = ", ssim / evaluation_count)
-            for bad_px_ratio, bad_px_ratio_threshold in zip(bad_px_ratios, args.bad_px_ratio_thresholds):
+            for bad_px_ratio, bad_px_ratio_threshold in zip(bad_px_ratios, args.bad_px_ratio_thresholds, strict=True):
                 print(">", bad_px_ratio_threshold, " = ", bad_px_ratio / evaluation_count)
             print("MAE = ", mae / evaluation_count)
             print("RMSE = ", rmse / evaluation_count)

@@ -1,2 +1,11 @@
 
 .DS_Store
+venv/
+.venv/
+resources/output/
+resources_order_changed/
+insta360pro_data/
+insta360pro_data_no_mask/
+
+.vscode/
+python/__pycache__/

@@ -27,6 +27,12 @@ The use of the software is for Non-Commercial Purposes only. As used in this Agr
 Warranty: KAIST-VCLAB MAKES NO REPRESENTATIONS OR WARRANTIES ABOUT THE SUITABILITY OF THE SOFTWARE, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, OR NON-INFRINGEMENT. KAIST-VCLAB SHALL NOT BE LIABLE FOR ANY DAMAGES SUFFERED BY LICENSEE AS A RESULT OF USING, MODIFYING OR DISTRIBUTING THIS SOFTWARE OR ITS DERIVATIVES.
 Please refer to license.txt for more details.
 =======================================================================
+Changes made to this file:
+--------------------------
+author: Stefan Spiss
+changes:
+- Added additional vector operations with swapped order of operands
+===================================================================
 **/
 
 typedef unsigned char uchar;

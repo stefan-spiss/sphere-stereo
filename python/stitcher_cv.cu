@@ -37,322 +37,16 @@ WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, OR NON-INFRINGE
 SHALL NOT BE LIABLE FOR ANY DAMAGES SUFFERED BY LICENSEE AS A RESULT OF USING, MODIFYING OR
 DISTRIBUTING THIS SOFTWARE OR ITS DERIVATIVES. Please refer to license.txt for more details.
 =======================================================================
+File information
+-----------------
+Code is same as in stitcher.cu, but it allows for using the Kannala-Brandt camera model with the help of templates and small other changes.
 
-Code is same as in stitcher.cu, but instead of using unproject and project from DoubleSphereModel,
-the OpenCV fisheye model is used.
+Author: Stefan Spiss
+========================================================================================
 **/
 
-struct Intrinsics_CV {
-    float2 fl, principal;
-    float4 ks;
-    float max_theta;
-};
-
-#define PI 3.14159265f
-
-struct Rotation {
-    float r[3][3];
-};
-
-inline __device__ float3 matMul3x3(const float r[3][3], float3 vect) {
-    return make_float3(r[0][0] * vect.x + r[0][1] * vect.y + r[0][2] * vect.z,
-                       r[1][0] * vect.x + r[1][1] * vect.y + r[1][2] * vect.z,
-                       r[2][0] * vect.x + r[2][1] * vect.y + r[2][2] * vect.z);
-}
-
-inline __device__ int sign(float x) { return (x > 0) - (x < 0); }
-
-/**
- * Linear interpolation and type conversion in image.
- * Does not perform out of image boundaries check.
- */
-inline __device__ float3 interp(const uchar3* sampled, float2 uv, int columns = COLS) {
-    int u1, u2, v1, v2;
-    u1 = __float2int_rd(uv.x);
-    v1 = __float2int_rd(uv.y);
-
-    u2 = u1 + 1;
-    v2 = v1 + 1;
-
-    float w1, w2, w3, w4;
-    float u1f = (float)u1;
-    float u2f = (float)u2;
-    float v1f = (float)v1;
-    float v2f = (float)v2;
-
-    w1 = (u2f - uv.x) * (v2f - uv.y);
-    w2 = (u2f - uv.x) * (uv.y - v1f);
-    w3 = (uv.x - u1f) * (v2f - uv.y);
-    w4 = (uv.x - u1f) * (uv.y - v1f);
-
-    float3 p1, p2, p3, p4;
-    p1 = uchar3Tofloat3(sampled[v1 * columns + u1]);
-    p2 = uchar3Tofloat3(sampled[v2 * columns + u1]);
-    p3 = uchar3Tofloat3(sampled[v1 * columns + u2]);
-    p4 = uchar3Tofloat3(sampled[v2 * columns + u2]);
-
-    return (w1 * p1 + w2 * p2 + w3 * p3 + w4 * p4);
-}
-
-/**
- * Linear interpolation and type conversion in float map.
- * Does not perform out of image boundaries check.
- */
-inline __device__ float interpF(const float* sampled, float2 uv, int columns = COLS) {
-    int u1, u2, v1, v2;
-    u1 = __float2int_rd(uv.x);
-    v1 = __float2int_rd(uv.y);
-
-    u2 = u1 + 1;
-    v2 = v1 + 1;
-
-    float w1, w2, w3, w4;
-    float u1f = (float)u1;
-    float u2f = (float)u2;
-    float v1f = (float)v1;
-    float v2f = (float)v2;
-
-    w1 = (u2f - uv.x) * (v2f - uv.y);
-    w2 = (u2f - uv.x) * (uv.y - v1f);
-    w3 = (uv.x - u1f) * (v2f - uv.y);
-    w4 = (uv.x - u1f) * (uv.y - v1f);
-
-    float p1, p2, p3, p4;
-    p1 = (sampled[v1 * columns + u1]);
-    p2 = (sampled[v2 * columns + u1]);
-    p3 = (sampled[v1 * columns + u2]);
-    p4 = (sampled[v2 * columns + u2]);
-
-    return (w1 * p1 + w2 * p2 + w3 * p3 + w4 * p4);
-}
-
-/**
- * Function calculates theta given r_theta using Newton-Raphson method
- */
-inline __device__ float2 solve_for_theta(float r_theta, Intrinsics_CV calib) {
-    float theta = r_theta;
-    float theta_fix = 0.0f;
-
-    bool should_iterate =
-        (r_theta > EPSILON);  // helps to avoid divergence at warp level (according to chatgpt)
-
-    if (should_iterate) {
-        float k1 = calib.ks.x;
-        float k2 = calib.ks.y;
-        float k3 = calib.ks.z;
-        float k4 = calib.ks.w;
-
-        for (int i = 0; i < MAX_ITER; i++) {
-            float theta2 = theta * theta;
-            float func =
-                fmaf(fmaf(fmaf(fmaf(k4, theta2, k3), theta2, k2), theta2, k1), theta2, 1) * theta;
-
-            float d_func_d_theta =
-                fmaf(fmaf(fmaf(fmaf(9 * k4, theta2, 7 * k3), theta2, 5 * k2), theta2, 3 * k1),
-                     theta2, 1);
-
-            theta_fix = (func - r_theta) / d_func_d_theta;
-
-            theta = theta - theta_fix;
-
-            if (theta_fix * theta_fix < EPSILON * EPSILON) {
-                break;
-            }
-        }
-    }
-
-    return make_float2(theta, theta_fix);
-}
-
-/**
- * Unproject pixels to the unit sphere using the Kannala and Brandt model.
- */
-struct FisheyeKB {
-    inline __device__ float3 unproject(float2 uv, Intrinsics_CV calib) {
-        // float2 pi = uv;
-        float2 pw = (uv - calib.principal) / calib.fl;
-
-        float r_theta = sqrtf(pw.x * pw.x + pw.y * pw.y);
-
-        float2 result = solve_for_theta(r_theta, calib);
-        float theta = result.x;
-        float theta_residual = result.y;
-
-        float scale = sin(theta) / r_theta;
-
-        // theta is monotonously increasing or decreasing depending on the sign of theta. If theta
-        // has flipped, it might converge due to the symmetry, but on the wrong side of the camera
-        // center. Here we check if the sign of theta has flipped during optimization bool
-        // theta_flipped = (signbit(r_theta) != signbit(theta)); bool theta_flipped = ((r_theta < 0
-        // && theta > 0) || (r_theta > 0 && theta < 0));
-        bool theta_flipped = (sign(r_theta) != sign(theta));
-        bool theta_converged = (theta_residual * theta_residual < EPSILON * EPSILON);
-        bool theta_in_range = (theta * theta < calib.max_theta * calib.max_theta);
-
-
-#ifdef NON_VALID_TO_NAN
-        float3 point = make_float3(nanf(""), nanf(""), nanf(""));
-        bool valid = !theta_flipped && theta_converged && theta_in_range;
-        if (valid)
-        {
-            point = make_float3(pw.x * scale, pw.y * scale, cosf(theta));
-            point = point / length(point);
-        }
-#else
-        float3 point = make_float3(pw.x * scale, pw.y * scale, cosf(theta));
-        point = point / length(point);
-#endif
-        return point;
-    }
-
-    /**
-     * Project a point in space to pixel coordinates
-     */
-    inline __device__ float2 project(float3 point, Intrinsics_CV calib) {
-        bool valid = true;
-        float2 out = project(point, calib, valid);
-
-#ifdef NON_VALID_TO_NAN
-        if (!valid)
-        {
-            float2 out = make_float2(nanf(""), nanf(""));
-        }
-#endif
-        return out;
-    }
-
-    /**
-     * Project a point in space to pixel coordinates and set valid to false if the 3D point
-     * is out of the cv fisheye model's scope (fov > calib.max_theta)
-     */
-    inline __device__ float2 project(float3 point, Intrinsics_CV calib, bool& valid) {
-        float2 uv = make_float2(point.x, point.y);
-        float z = point.z;
-
-        float r = length(uv);
-
-        float theta = atan2f(r, z);
-
-        float k1 = calib.ks.x;
-        float k2 = calib.ks.y;
-        float k3 = calib.ks.z;
-        float k4 = calib.ks.w;
-
-        float theta2 = theta * theta;
-
-        float r_theta = fmaf(fmaf(fmaf(fmaf(k4, theta2, k3), theta2, k2), theta2, k1), theta2, 1) * theta;
-
-        bool r_valid = (r > MIN_LIMIT);
-        bool z_valid = (z * z > MIN_LIMIT * MIN_LIMIT);
-        float inv_r = r_valid ? 1.f / r : z_valid ? 1.f / z : 1.f;
-
-        float cdist = r_theta * inv_r;
-
-        float2 out = uv * cdist * calib.fl + calib.principal;
-
-        bool theta_in_range = (theta * theta < calib.max_theta * calib.max_theta);
-        valid &= ((r_valid || z_valid) && theta_in_range);
-
-        return out;
-    }
-};
-
-/**
- * Unproject pixels to the unit sphere using the Kannala and Brandt model with a perspective
- * projection using the identity camera matrix following the OpenCV fisheye model. Code very similar
- * to OpenCV fisheye::undistortPoints
- */
-struct FisheyeKBPerspectiveProjection {
-    inline __device__ float3 unproject(float2 uv, Intrinsics_CV calib) {
-        // float2 pi = uv;
-        float2 pw = (uv - calib.principal) / calib.fl;
-
-        float r_theta = sqrtf(pw.x * pw.x + pw.y * pw.y);
-        r_theta = fmin(fmax(0.0f, r_theta), PI * 0.5f);
-
-        float2 result = solve_for_theta(r_theta, calib);
-        float theta = result.x;
-        float theta_residual = result.y;
-
-        theta = fmin(fmax(-PI * 0.5f, theta), PI * 0.5f);
-
-        float scale = tanf(theta) / r_theta;
-
-        // theta is monotonously increasing or decreasing depending on the sign of theta. If theta
-        // has flipped, it might converge due to the symmetry, but on the wrong side of the camera
-        // center. Here we check if the sign of theta has flipped during optimization
-        bool theta_flipped = (sign(r_theta) != sign(theta));
-        bool theta_converged = (theta_residual * theta_residual < EPSILON * EPSILON);
-        bool theta_in_range = (theta * theta < calib.max_theta * calib.max_theta);
-
-
-#ifdef NON_VALID_TO_NAN
-        float3 point = make_float3(nanf(""), nanf(""), nanf(""));
-        bool valid = !theta_flipped && theta_converged && theta_in_range;
-        if (valid)
-        {
-            float3 point = make_float3(pw.x * scale, pw.y * scale, 1.0f);
-            point = point / length(point);
-        }
-#else
-        float3 point = make_float3(pw.x * scale, pw.y * scale, 1.0f);
-        point = point / length(point);
-#endif
-
-        return point;
-    }
-
-    /**
-     * Project a point in space to pixel coordinates
-     */
-    inline __device__ float2 project(float3 point, Intrinsics_CV calib) {
-        bool valid = true;
-        float2 out = project(point, calib, valid);
-
-#ifdef NON_VALID_TO_NAN
-        if (!valid)
-        {
-            float2 out = make_float2(nanf(""), nanf(""));
-        }
-#endif
-        return out;
-    }
-
-    /**
-     * Project a point in space to pixel coordinates and set valid to false if the 3D point
-     * is out of the cv fisheye model's scope (fov > calib.max_theta)
-     */
-    inline __device__ float2 project(float3 point, Intrinsics_CV calib, bool& valid) {
-        float2 uv = make_float2(point.x / point.z, point.y / point.z);
-
-        float z = 1.0f * sign(point.z);
-
-        float r = length(uv);
-
-        float theta = atan2f(r, z);
-
-        float k1 = calib.ks.x;
-        float k2 = calib.ks.y;
-        float k3 = calib.ks.z;
-        float k4 = calib.ks.w;
-
-        float theta2 = theta * theta;
-
-        float r_theta = fmaf(fmaf(fmaf(fmaf(k4, theta2, k3), theta2, k2), theta2, k1), theta2, 1) * theta;
-
-        bool r_valid = (r > MIN_LIMIT);
-        float inv_r = r_valid ? 1.f / r : 1.f;
-
-        float cdist = r_theta * inv_r;
-
-        float2 out = uv * cdist * calib.fl + calib.principal;
-
-        bool theta_in_range = (theta * theta < calib.max_theta * calib.max_theta);
-        valid &= theta_in_range;
-
-        return out;
-    }
-};
+// #define DEBUG 1
+// #define NON_VALID_TO_NAN 1
 
 /**
  * Reproject the fisheye image to the reference view point using z-buffering,
@@ -367,7 +61,7 @@ struct FisheyeKBPerspectiveProjection {
  */
 template <typename Op>
 __global__ void reprojectDistanceKernel(const float* distanceIn, float* distanceOut,
-                                        const Intrinsics_CV* calib, const float3* translation) {
+                                        const IntrinsicsKB* calib, const float3* translation) {
     int indexIn = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (indexIn < COLS * ROWS) {
@@ -376,8 +70,10 @@ __global__ void reprojectDistanceKernel(const float* distanceIn, float* distance
         Op camModel;
 
         // Find the corresponding 3D point w.r.t the reference view point
-        float3 pt = camModel.unproject(pixel, *calib);
-        if (!isnan(pt.x) && !isnan(pt.y) && !isnan(pt.z)) {
+        bool valid = true;
+        float3 pt = camModel.unproject(pixel, *calib, valid);
+        // if (!isnan(pt.x) && !isnan(pt.y) && !isnan(pt.z)) {
+        if (valid) {
             pt = distanceIn[indexIn] * pt - *translation;
 
             // Find the corresponding pixel
@@ -393,13 +89,13 @@ __global__ void reprojectDistanceKernel(const float* distanceIn, float* distance
 }
 
 /**
- * Select the best neighbour pixels for inpainting depending on the occusion direction
+ * Select the best neighbour pixels for inpainting depending on the occlusion direction
  * inpaintDirWeights: Encoding for a two-pixels inpainting kernel.
  * calib: pointer to the calibration vector. Should follow the Intrinsics' structure
  * translation: pointer to the translation from the reference view point to the camera
  */
 template <typename Op>
-__global__ void createInpaintingWeightsKernel(uchar2* inpaintDirWeights, const Intrinsics_CV* calib,
+__global__ void createInpaintingWeightsKernel(uchar2* inpaintDirWeights, const float* maxMinDist, const IntrinsicsKB* calib,
                                               const float3* translation) {
     int indexIn = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -409,9 +105,12 @@ __global__ void createInpaintingWeightsKernel(uchar2* inpaintDirWeights, const I
         Op camModel;
 
         // Obtain inpainting direction v_{T*} (see Section 3.3)
-        float3 unit = camModel.unproject(pixel, *calib);
+        bool valid = true;
+        float3 unit = camModel.unproject(pixel, *calib, valid);
+        
+        float minDist = *maxMinDist;
 
-        float2 pxClose = camModel.project(MIN_DIST * unit - *translation, *calib);
+        float2 pxClose = camModel.project(minDist * unit - *translation, *calib);
         float2 pxFar = camModel.project(MAX_DIST * unit - *translation, *calib);
 
         float2 inpaintDir = pxFar - pxClose;
@@ -516,15 +215,15 @@ extern "C" __global__ void inpaintKernel(float* distanceMap, const uchar2* inpai
  */
 template <typename Op>
 __global__ void createBlendingLutKernel(float2* samplingLut, float* blendingWeights, float* masks,
-                                        const Intrinsics_CV* calibs, const Rotation* rotations,
-                                        const float3* translations) {
+                                        const float* maxMinDist, const IntrinsicsKB* calibs,
+                                        const Rotation* rotations, const float3* translations) {
     int indexIn = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (indexIn < PANO_ROWS * PANO_COLS) {
         // Get the sphere point corresponding to the current pixel
         float2 pixel = {float(indexIn % PANO_COLS), float(indexIn / PANO_COLS)};
         float phi = (float(pixel.y) + 0.5f) * PI / PANO_ROWS - PI / 2.f;
-        float theta = (float(pixel.x) + 0.5f) * 2.f * PI / PANO_COLS + PI;
+        float theta = (float(pixel.x) + 0.5f) * 2.f * PI / PANO_COLS - PI;
         float3 unitPointPanorama = {cosf(phi) * sinf(theta), sinf(phi), cosf(phi) * cosf(theta)};
 
         Op camModel;
@@ -542,25 +241,41 @@ __global__ void createBlendingLutKernel(float2* samplingLut, float* blendingWeig
             samplingLut[referenceIndex * PANO_ROWS * PANO_COLS + indexIn] = uv;
 
             // Evaluate the sampling location displacement for a given change in distance
-            blendingWeight[referenceIndex] = 1e-8;
+            blendingWeight[referenceIndex] = 0.0f;
 
-            float2 pxNear =
-                camModel.project(MIN_DIST * unitInFisheye - translations[referenceIndex],
-                                 calibs[referenceIndex], valid);
-            pxNear.x = min(max(pxNear.x, 0.1f), float(COLS) - 1.1f);
-            pxNear.y = float(referenceIndex * ROWS) + min(max(pxNear.y, 0.1f), float(ROWS) - 1.1f);
+            // float minDist = MIN_DIST;
+            // float minDist =
+            //     interpFwithBoundCheck(minDistances, uv, referenceIndex * ROWS * COLS, COLS, ROWS,
+            //     MIN_DIST);
+            float minDist = *maxMinDist;
+
+            float2 pxNear = camModel.project(minDist * unitInFisheye - translations[referenceIndex],
+                                             calibs[referenceIndex], valid);
+            valid &= pxNear.x > 0.1f && pxNear.x < float(COLS) - 1.1f && pxNear.y > 0.1f &&
+                     pxNear.y < float(ROWS) - 1.1f;
+            // pxNear.x = min(max(pxNear.x, 0.1f), float(COLS) - 1.1f);
+            // pxNear.y = float(referenceIndex * ROWS) + min(max(pxNear.y, 0.1f), float(ROWS)
+            // - 1.1f);
+
             float2 pxFar = camModel.project(MAX_DIST * unitInFisheye - translations[referenceIndex],
                                             calibs[referenceIndex], valid);
-            pxFar.x = min(max(pxFar.x, 0.1f), float(COLS) - 1.1f);
-            pxFar.y = float(referenceIndex * ROWS) + min(max(pxFar.y, 0.1f), float(ROWS) - 1.1f);
+            valid &= pxFar.x > 0.1f && pxFar.x < float(COLS) - 1.1f && pxFar.y > 0.1f &&
+                     pxFar.y < float(ROWS) - 1.1f;
+            // pxFar.x = min(max(pxFar.x, 0.1f), float(COLS) - 0.1f);
+            // pxFar.y = float(referenceIndex * ROWS) + min(max(pxFar.y, 0.1f), float(ROWS) - 1.1f);
 
-            if (valid && interpF(masks, pxNear) > 0.99 && interpF(masks, pxFar) > 0.99) {
+            if (valid && interpF(masks, pxNear + make_float2(0.f, referenceIndex * ROWS)) > 0.99 &&
+                interpF(masks, pxFar + make_float2(0.f, referenceIndex * ROWS)) > 0.99) {
                 float2 displacementVector(pxFar - pxNear);
                 float displacementStrength(length(displacementVector));
 
                 // Compute warp-aware blending weights to merge fisheye images
                 blendingWeight[referenceIndex] =
                     expf(-displacementStrength * displacementStrength / (1e-4 * ROWS * COLS));
+                // } else {
+                //     blendingWeight[referenceIndex] = 0.f;
+                //     samplingLut[referenceIndex * PANO_ROWS * PANO_COLS + indexIn] =
+                //     make_float2(-1.f, -1.f);
             }
 
             blendingWeightSum += blendingWeight[referenceIndex];
@@ -568,37 +283,39 @@ __global__ void createBlendingLutKernel(float2* samplingLut, float* blendingWeig
 
         for (int referenceIndex = 0; referenceIndex < REFERENCES_COUNT; referenceIndex++) {
             blendingWeights[referenceIndex * PANO_ROWS * PANO_COLS + indexIn] =
-                blendingWeight[referenceIndex] / blendingWeightSum;
+                blendingWeight[referenceIndex] /
+                (blendingWeightSum + 1e-8);  // To avoid division by 0
         }
     }
 }
 
 /**
  * Merge the fisheye distance maps and images from the reference cameras into a complete RGB-D
- * panorama. samplingLut: [REFERENCES_COUNT, PANO_ROWS, PANO_COLS] pixel coordinates to sample in
- * the reference images to create the panorama blendingWeights: [REFERENCES_COUNT, PANO_ROWS,
- * PANO_COLS] Blending weights for each of the fisheye camera used for stitching
- * reprojectedDistanceMaps: [REFERENCES_COUNT, ROWS, COLS] Distance maps
- *   reprojected at reference view point and inpainted
- * distanceMaps: [REFERENCES_COUNT, ROWS, COLS] Original distance maps
- *   at the cameras' locations. Used to reproject RGB images
- * stitchingImgs: [REFERENCES_COUNT, stitchingImgsRows, stitchingImgsCols]
- *   Fisheye images used for colour stitching.
- *   They may have a higher resolution than the distance map as it has a neglectible impact on
- * performance. (The same number of sampling is required regardless of its resolution)
+ * panorama.
+ * samplingLut: [REFERENCES_COUNT, PANO_ROWS, PANO_COLS] pixel coordinates to sample in the
+ *   reference images to create the panorama
+ * blendingWeights: [REFERENCES_COUNT, PANO_ROWS, PANO_COLS] Blending weights for each of the
+ *   fisheye camera used for stitching
+ * reprojectedDistanceMaps: [REFERENCES_COUNT, ROWS, COLS] Distance maps reprojected at reference
+ *   view point and inpainted
+ * distanceMaps: [REFERENCES_COUNT, ROWS, COLS] Original distance maps at the cameras' locations.
+ *   Used to reproject RGB images
+ * stitchingImgs: [REFERENCES_COUNT, stitchingImgsRows, stitchingImgsCols] Fisheye images used for
+ *   colour stitching. They may have a higher resolution than the distance map as it has a neglectible
+ *   impact on performance. (The same number of sampling is required regardless of its resolution)
  * stitchingImgsRows, stitchingImgsCols: Resolution of the colour images sampled during stitching.
  * calibs: Set of REFERENCES_COUNT calibration vectors. Should follow the Intrinsics' structure
  * rotations: Set of REFERENCES_COUNT rotations. Should follow the Rotation's structure
  * DistancePanorama: [PANO_ROWS, PANO_COLS] Output distance panorama stitched from
  * reprojectedDistanceMaps RGBPanorama: [PANO_ROWS, PANO_COLS] Output colour panorama stitched from
- * stitchingImgs
+ *   stitchingImgs
  */
 template <typename Op>
 __global__ void mergeRGBDPanoramaKernel(const float2* samplingLut, const float* blendingWeights,
                                         const float* reprojectedDistanceMaps,
                                         const float* distanceMaps, const uchar3* stitchingImgs,
                                         int stitchingImgsRows, int stitchingImgsCols,
-                                        const float3* translations, const Intrinsics_CV* calibs,
+                                        const float3* translations, const IntrinsicsKB* calibs,
                                         float* DistancePanorama, uchar3* RGBPanorama) {
     int indexIn = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -614,17 +331,31 @@ __global__ void mergeRGBDPanoramaKernel(const float2* samplingLut, const float* 
                 blendingWeights[referenceIndex * PANO_ROWS * PANO_COLS + indexIn];
             float2 uv = samplingLut[referenceIndex * PANO_ROWS * PANO_COLS + indexIn];
 
+            // // To skip the pixel if it is outside the image
+            // if (uv.x < 0.f || uv.y < 0.f || uv.x > float(COLS) - 1.1f || uv.y > float(ROWS) - 1.1f)
+            // {
+            //     continue;
+            // }
+
             // Sample and reprojected distance and update the blended output distance
+            // Caclulation of offset to distance map of reference camera with reference index:
+            // reprojectedDistanceMaps tensor shape = [REFERENCES_COUNT, ROWS, COLS]
+            // offset = (referenceIndex * ROWS * COLS) + (v * COLS) + u
+            //        = ((referenceIndex * ROWS) + v) * COLS + u 
+            // In interpF, multiplication with COLS happens -> only adding (referenceIndex * ROWS) to v.
             float reprojectedDistance = interpF(
-                reprojectedDistanceMaps, uv + make_float2(0.f, float(referenceIndex * ROWS)));
+                reprojectedDistanceMaps, uv + make_float2(0.f, float(referenceIndex * ROWS)), COLS);
             avgInvDistance += blendingWeight * 1.f / reprojectedDistance;
 
             float distanceForColorReprojection =
-                interpF(distanceMaps, uv + make_float2(0.f, float(referenceIndex * ROWS)));
+                interpF(distanceMaps, uv + make_float2(0.f, float(referenceIndex * ROWS)), COLS);
             distanceForColorReprojection = min(reprojectedDistance, distanceForColorReprojection);
 
             // Find the corresponding 3D point w.r.t the reference view point
-            float3 pt = camModel.unproject(uv, calibs[referenceIndex]);
+            bool valid = true;
+            float3 pt = camModel.unproject(uv, calibs[referenceIndex], valid);
+            // if (!valid) continue;
+
             pt = distanceForColorReprojection * pt + translations[referenceIndex];
 
             // Find the corresponding pixel
@@ -646,64 +377,3 @@ __global__ void mergeRGBDPanoramaKernel(const float2* samplingLut, const float* 
         RGBPanorama[indexIn] = float3Touchar3(RGB);
     }
 }
-
-// extern "C" {
-// void reprojectDistanceKernelFisheyeKB(const float* distanceIn, float* distanceOut,
-//                                                  const Intrinsics_CV* calib,
-//                                                  const float3* translation) {
-//     reprojectDistanceKernel<FisheyeKB>
-//         <<<gridDim, blockDim>>>(distanceIn, distanceOut, calib, translation);
-// }
-// void reprojectDistanceKernelFisheyeKBPerspectiveProjection(const float* distanceIn,
-//                                                                       float* distanceOut,
-//                                                                       const Intrinsics_CV* calib,
-//                                                                       const float3* translation) {
-//     reprojectDistanceKernel<FisheyeKBPerspectiveProjection>
-//         <<<gridDim, blockDim>>>(distanceIn, distanceOut, calib, translation);
-// }
-
-// void createInpaintingWeightsKernelFisheyeKB(uchar2* inpaintDirWeights,
-//                                                        const Intrinsics_CV* calib,
-//                                                        const float3* translation) {
-//     createInpaintingWeightsKernel<FisheyeKB>
-//         <<<gridDim, blockDim>>>(inpaintDirWeights, calib, translation);
-// }
-// void createInpaintingWeightsKernelFisheyeKBPerspectiveProjection(
-//     uchar2* inpaintDirWeights, const Intrinsics_CV* calib, const float3* translation) {
-//     createInpaintingWeightsKernel<FisheyeKBPerspectiveProjection>
-//         <<<gridDim, blockDim>>>(inpaintDirWeights, calib, translation);
-// }
-
-// void createBlendingLutKernelFisheyeKB(float2* samplingLut, float* blendingWeights,
-//                                                  float* masks, const Intrinsics_CV* calibs,
-//                                                  const Rotation* rotations,
-//                                                  const float3* translations) {
-//     createBlendingLutKernel<FisheyeKB><<<gridDim, blockDim>>>(samplingLut, blendingWeights, masks,
-//                                                               calibs, rotations, translations);
-// }
-// void createBlendingLutKernelFisheyeKBPerspectiveProjection(
-//     float2* samplingLut, float* blendingWeights, float* masks, const Intrinsics_CV* calibs,
-//     const Rotation* rotations, const float3* translations) {
-//     createBlendingLutKernel<FisheyeKBPerspectiveProjection><<<gridDim, blockDim>>>(
-//         samplingLut, blendingWeights, masks, calibs, rotations, translations);
-// }
-
-// void mergeRGBDPanoramaKernelFisheyeKB(
-//     const float2* samplingLut, const float* blendingWeights, const float* reprojectedDistanceMaps,
-//     const float* distanceMaps, const uchar3* stitchingImgs, int stitchingImgsRows,
-//     int stitchingImgsCols, const float3* translations, const Intrinsics_CV* calibs,
-//     float* DistancePanorama, uchar3* RGBPanorama) {
-//     mergeRGBDPanoramaKernel<FisheyeKB><<<gridDim, blockDim>>>(
-//         samplingLut, blendingWeights, reprojectedDistanceMaps, distanceMaps, stitchingImgs,
-//         stitchingImgsRows, stitchingImgsCols, translations, calibs, DistancePanorama, RGBPanorama);
-// }
-// void mergeRGBDPanoramaKernelFisheyeKBPerspectiveProjection(
-//     const float2* samplingLut, const float* blendingWeights, const float* reprojectedDistanceMaps,
-//     const float* distanceMaps, const uchar3* stitchingImgs, int stitchingImgsRows,
-//     int stitchingImgsCols, const float3* translations, const Intrinsics_CV* calibs,
-//     float* DistancePanorama, uchar3* RGBPanorama) {
-//     mergeRGBDPanoramaKernel<FisheyeKBPerspectiveProjection><<<gridDim, blockDim>>>(
-//         samplingLut, blendingWeights, reprojectedDistanceMaps, distanceMaps, stitchingImgs,
-//         stitchingImgsRows, stitchingImgsCols, translations, calibs, DistancePanorama, RGBPanorama);
-// }
-// }

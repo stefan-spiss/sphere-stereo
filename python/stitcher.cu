@@ -27,93 +27,20 @@ The use of the software is for Non-Commercial Purposes only. As used in this Agr
 Warranty: KAIST-VCLAB MAKES NO REPRESENTATIONS OR WARRANTIES ABOUT THE SUITABILITY OF THE SOFTWARE, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, OR NON-INFRINGEMENT. KAIST-VCLAB SHALL NOT BE LIABLE FOR ANY DAMAGES SUFFERED BY LICENSEE AS A RESULT OF USING, MODIFYING OR DISTRIBUTING THIS SOFTWARE OR ITS DERIVATIVES.
 Please refer to license.txt for more details.
 =======================================================================
+Changes made to this file:
+--------------------------
+author: Stefan Spiss
+changes:
+- Moved general functions required in other files as well to utils.cuh file.
+===================================================================================
 **/
+
 struct Intrinsics
 {
     float2 fl, principal;
     float xi, alpha;
 };
 
-struct Rotation
-{
-    float r[3][3];
-};
-
-inline __device__ float3 matMul3x3(const float r[3][3], float3 vect)
-{
-	return make_float3
-	(
-		r[0][0] * vect.x + r[0][1] * vect.y + r[0][2] * vect.z,
-		r[1][0] * vect.x + r[1][1] * vect.y + r[1][2] * vect.z,
-		r[2][0] * vect.x + r[2][1] * vect.y + r[2][2] * vect.z
-    );
-}
-
-/**
- * Linear interpolation and type conversion in image. 
- * Does not perform out of image boundaries check.
- */
-inline __device__ float3 interp(const uchar3* sampled, float2 uv, int columns = COLS)
-{
-	int u1, u2, v1, v2;
-	u1 = __float2int_rd(uv.x);
-	v1 = __float2int_rd(uv.y);
-
-	u2 = u1 + 1;
-	v2 = v1 + 1;
-
-	float w1, w2, w3, w4;
-	float u1f = (float)u1;
-	float u2f = (float)u2;
-	float v1f = (float)v1;
-	float v2f = (float)v2;
-
-	w1 = (u2f - uv.x) * (v2f - uv.y);
-	w2 = (u2f - uv.x) * (uv.y - v1f);
-	w3 = (uv.x - u1f) * (v2f - uv.y);
-	w4 = (uv.x - u1f) * (uv.y - v1f);
-
-	float3 p1, p2, p3, p4;
-	p1 = uchar3Tofloat3(sampled[v1 * columns + u1]);
-	p2 = uchar3Tofloat3(sampled[v2 * columns + u1]);
-	p3 = uchar3Tofloat3(sampled[v1 * columns + u2]);
-	p4 = uchar3Tofloat3(sampled[v2 * columns + u2]);
-
-	return (w1 * p1 + w2 * p2 + w3 * p3 + w4 * p4);
-}
-
-/**
- * Linear interpolation and type conversion in float map. 
- * Does not perform out of image boundaries check.
- */
- inline __device__ float interpF(const float* sampled, float2 uv, int columns = COLS)
-{
-	int u1, u2, v1, v2;
-	u1 = __float2int_rd(uv.x);
-	v1 = __float2int_rd(uv.y);
-
-	u2 = u1 + 1;
-	v2 = v1 + 1;
-
-	float w1, w2, w3, w4;
-	float u1f = (float)u1;
-	float u2f = (float)u2;
-	float v1f = (float)v1;
-	float v2f = (float)v2;
-
-	w1 = (u2f - uv.x) * (v2f - uv.y);
-	w2 = (u2f - uv.x) * (uv.y - v1f);
-	w3 = (uv.x - u1f) * (v2f - uv.y);
-	w4 = (uv.x - u1f) * (uv.y - v1f);
-
-	float p1, p2, p3, p4;
-	p1 = (sampled[v1 * columns + u1]);
-	p2 = (sampled[v2 * columns + u1]);
-	p3 = (sampled[v1 * columns + u2]);
-	p4 = (sampled[v2 * columns + u2]);
-
-	return (w1 * p1 + w2 * p2 + w3 * p3 + w4 * p4);
-}
 
 /**
  * Unproject pixels to the unit sphere following the The Double Sphere Camera Model (https://arxiv.org/abs/1807.08957)
@@ -209,8 +136,8 @@ extern "C" __global__ void reprojectDistanceKernel(const float* distanceIn, floa
  * calib: pointer to the calibration vector. Should follow the Intrinsics' structure
  * translation: pointer to the translation from the reference view point to the camera
  */
- extern "C" __global__ void createInpaintingWeightsKernel(uchar2* inpaintDirWeights, 
-    const Intrinsics* calib, const float3* translation)
+ extern "C" __global__ void createInpaintingWeightsKernel(uchar2* inpaintDirWeights,
+    const float* maxMinDist, const Intrinsics* calib, const float3* translation)
 {
     int indexIn = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -221,7 +148,9 @@ extern "C" __global__ void reprojectDistanceKernel(const float* distanceIn, floa
         // Obtain inpainting direction v_{T*} (see Section 3.3)
         float3 unit = unproject(pixel, *calib);
 
-        float2 pxClose = project(MIN_DIST * unit - *translation, *calib);
+        float minDist = *maxMinDist;
+
+        float2 pxClose = project(minDist * unit - *translation, *calib);
         float2 pxFar = project(MAX_DIST * unit - *translation, *calib);
         
         float2 inpaintDir = pxFar - pxClose;
@@ -336,7 +265,8 @@ extern "C" __global__ void reprojectDistanceKernel(const float* distanceIn, floa
  * translations: Set of REFERENCES_COUNT translations from the reference view point to the cameras
  */
  extern "C" __global__ void createBlendingLutKernel(float2* samplingLut, float* blendingWeights, 
-	float* masks, const Intrinsics* calibs, const Rotation* rotations, const float3* translations)
+	float* masks, const float* maxMinDist, const Intrinsics* calibs, const Rotation* rotations,
+    const float3* translations)
 {
 	int indexIn = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -369,7 +299,10 @@ extern "C" __global__ void reprojectDistanceKernel(const float* distanceIn, floa
             // Evaluate the sampling location displacement for a given change in distance
             blendingWeight[referenceIndex] = 1e-8;
             
-            float2 pxNear = project(MIN_DIST * unitInFisheye - translations[referenceIndex], 
+            // float minDist = MIN_DIST;
+            float minDist = *maxMinDist;
+
+            float2 pxNear = project(minDist * unitInFisheye - translations[referenceIndex], 
                 calibs[referenceIndex], valid);
             pxNear.x = min(max(pxNear.x, 0.1f), float(COLS) - 1.1f);
             pxNear.y = float(referenceIndex * ROWS) + min(max(pxNear.y, 0.1f), float(ROWS) - 1.1f);

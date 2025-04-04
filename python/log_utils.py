@@ -4,7 +4,10 @@
 import logging
 import sys
 
+__default_log_level = logging.DEBUG
+
 __logger = logging.getLogger('sphere-stereo')
+__logger.setLevel(__default_log_level)
 LOG_INFO = __logger.info
 LOG_ERROR = __logger.error
 LOG_WARNING = __logger.warning
@@ -25,10 +28,15 @@ class ConsoleStreamHandler(logging.StreamHandler):
             self.stream = self.info_stream
         super().emit(record)
 
+
 # Idea from https://stackoverflow.com/questions/384076/how-can-i-color-python-logging-output?page=1&tab=scoredesc#tab-top
 # help with chatgpt
 class Formatter(logging.Formatter):
-    def __init__(self, format_str='[%(levelname)s: %(asctime)s] %(message)s (%(filename)s:%(lineno)d)', datefmt='%y.%m.%d %H:%M:%S'):
+    def __init__(
+        self,
+        format_str='[%(levelname)s: %(asctime)s] %(message)s (%(filename)s:%(lineno)d)',
+        datefmt='%y.%m.%d %H:%M:%S',
+    ):
         super().__init__(format_str, datefmt)
         grey = '\x1b[38;20m'
         yellow = '\x1b[33;20m'
@@ -40,7 +48,7 @@ class Formatter(logging.Formatter):
             logging.INFO: grey + format_str + reset,
             logging.WARNING: yellow + format_str + reset,
             logging.ERROR: red + format_str + reset,
-            logging.CRITICAL: bold_red + format_str + reset
+            logging.CRITICAL: bold_red + format_str + reset,
         }
 
     def format(self, record):
@@ -49,15 +57,25 @@ class Formatter(logging.Formatter):
         return super().format(record)
 
 
-def initLogging(level):
-    __logger.setLevel(level)
+def initLogging():
+    __logger.setLevel(__default_log_level)
 
     console_stream_handler = ConsoleStreamHandler(sys.stdout, sys.stderr)
-    console_stream_handler.setLevel(level)
+    console_stream_handler.setLevel(__default_log_level)
     console_stream_handler.setFormatter(Formatter())
 
     # Add handlers to the logger
+    if __logger.hasHandlers():
+        __logger.handlers.clear()
     __logger.addHandler(console_stream_handler)
+
+
+def setDefaultLoggerLevel(level):
+    __logger.setLevel(level)
+
+    for handler in __logger.handlers:
+        handler.setLevel(level)
+
 
 def setupLogger(name, level):
     logger = logging.getLogger(name)
@@ -70,4 +88,3 @@ def setupLogger(name, level):
     # Add handlers to the logger
     logger.addHandler(console_stream_handler)
     return logger
-

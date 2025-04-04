@@ -29,32 +29,16 @@ Please refer to license.txt for more details.
 =======================================================================
 """
 import math
-from os import name
-import sys
 
 import cupy
-from cv2 import log
-from numpy import std
 import torch
-
 from log_utils import LOG_DEBUG, LOG_ERROR, LOG_INFO
 from utils import CamModel
 
-# def vectorize_calibration(calibration, device):
-#     """
-#     Convert the intrinsics into a continuous float vector that follows the Intrinsics' structure
-#     (See stitcher.cu for Intrinsics' definition)
-#     Scale the focal length and the principal point using the matching scale.
-#     """
-#     calibration_vector = torch.zeros([6], device=device)
-#     calibration_vector[0:2] = calibration.fl * calibration.matching_scale
-#     calibration_vector[2:4] = calibration.principal * calibration.matching_scale
-#     calibration_vector[4] = calibration.xi
-#     calibration_vector[5] = calibration.alpha
-#     return calibration_vector
 
 class Stitcher:
-    def __init__(self, calibrations: list[CamModel], reprojection_viewpoint: torch.Tensor, masks: list[torch.Tensor], min_dist: float, max_dist: float, 
+    def __init__(self, calibrations: list[CamModel], reprojection_viewpoint: torch.Tensor, masks: list[torch.Tensor], 
+                 min_distances_per_reference: list[torch.Tensor] | None, min_dist: float, max_dist: float, 
                  matching_resolution: list[int], rgb_to_stitch_resolution: list[int], panorama_resolution: list[int], 
                  device: torch.device | str, smoothing_radius: int = 15, inpainting_iterations: int = 32):
         """
@@ -64,6 +48,8 @@ class Stitcher:
             calibrations: [number of references] calibration parameters following the double sphere model for each camera
             reprojection_viewpoint: [3] Reference viewpoint where the RGB-D panorama will be created
             masks: [number of references][matching_rows, matching_cols] Mask of the valid area in the captured fisheye image.
+            min_distances_per_reference: [number of references][matching_rows, matching_cols] Minimum distance for each pixel
+                in the fisheye image of each reference cam. If None, the minimum distance used for stitching is set to min_dist.
             min_dist, max_dist: minimum and maximum distance expected in the distance maps
             matching_resolution: Resolution (cols, rows) used for matching. May be lower than original to save computation
             rgb_to_stitch_resolution: Resolution (cols, rows) of the colour images sampled during stitching. 
@@ -89,6 +75,8 @@ class Stitcher:
         # Read and compile CUDA functions
         with open('python/vec_utils.cuh') as f:
             utils_source = f.read()
+        with open('python/utils.cuh') as f:
+            utils_source += f.read()
 
         cam_model = calibrations[0].model
         for calib in calibrations:
@@ -98,11 +86,14 @@ class Stitcher:
         if cam_model == "double_sphere":
             with open('python/stitcher.cu') as f:
                 cuda_source = utils_source + f.read()
-        elif cam_model == "cv_fisheye":
-            with open('python/stitcher_cv.cu') as f:
+        elif cam_model == "kb_fisheye":
+            with open('python/kb_fisheye.cuh') as f:
                 cuda_source = utils_source + f.read()
-                cuda_source = cuda_source.replace("MAX_ITER", str(calibrations[0].unproj_crit[1]))
-                cuda_source = cuda_source.replace("EPSILON", str(calibrations[0].unproj_crit[2]))
+            with open('python/stitcher_cv.cu') as f:
+                cuda_source += f.read()
+                cuda_source = cuda_source.replace("MAX_ITER", str(calibrations[0].unproj_crit[0]))
+                cuda_source = cuda_source.replace("UNPROJ_CRIT_0", str(calibrations[0].unproj_crit[1]))
+                cuda_source = cuda_source.replace("UNPROJ_CRIT_1", str(calibrations[0].unproj_crit[2]))
                 cuda_source = cuda_source.replace("MIN_LIMIT", str(calibrations[0].proj_crit))
         else:
             raise ValueError("Unknown camera model")
@@ -115,18 +106,15 @@ class Stitcher:
         cuda_source = cuda_source.replace("MIN_DIST", str(min_dist))
         cuda_source = cuda_source.replace("MAX_DIST", str(max_dist))
 
-
         # LOG_DEBUG(f"Cuda source:\n{cuda_source}")
 
         kernel_names = ['reprojectDistanceKernel', 'mergeRGBDPanoramaKernel', 'createInpaintingWeightsKernel', 'createBlendingLutKernel']
-        if cam_model == "cv_fisheye":
-            ext = '<FisheyeKB>' if calibrations[0].use_perspective_reproj else '<FisheyeKBPerspectiveProjection>'
+        if cam_model == "kb_fisheye":
+            ext = '<FisheyeKB>' if not calibrations[0].use_perspective_reproj else '<FisheyeKBPerspectiveProjection>'
             for i in range(len(kernel_names)):
                 kernel_names[i] += ext
 
         try:
-            # module = cupy.RawModule(code=cuda_source, options=("-std=c++11", "-Xptxas"))
-            # module = cupy.RawModule(code=cuda_source, options=("-std=c++11", "-rdc=true"))
             module = cupy.RawModule(code=cuda_source, options=("-std=c++11",), name_expressions=kernel_names)
             module.compile()
             LOG_INFO("CUDA compilation successful")
@@ -162,6 +150,13 @@ class Stitcher:
         self.RGB_panorama = torch.zeros(
             [panorama_resolution[1], panorama_resolution[0], 3], dtype=torch.uint8, device=device)
         self.distance_panorama = torch.zeros([panorama_resolution[1], panorama_resolution[0]], device=device)
+        
+        max_min_dist = torch.tensor(min_dist, dtype=torch.float32, device=device)
+        if min_distances_per_reference is not None:
+            max_min_distances_list = [torch.max(min_distances_per_reference[i]).item() for i in range(len(calibrations))]
+            max_min_distances = torch.tensor(max_min_distances_list, device=device).contiguous()
+            # max_min_dist = torch.median(max_min_distances)
+            max_min_dist = torch.min(max_min_distances)
 
         # Create tables for inpainting
         self.translations_list = []
@@ -176,8 +171,12 @@ class Stitcher:
                 block=(self.block_size,),
                 grid=(self.fisheye_grid_size,),
                 args=(inpainting_weight.data_ptr(), 
+                max_min_dist.data_ptr(),
                 calibration_vector.data_ptr(),
                 translation.data_ptr()))
+                
+            # # Debug variable for visualization in image viewer
+            # inpainting_weight_vis = inpainting_weight.cpu().numpy()
 
         # Create tables for merging fisheye images into panoramas
         rotations = [torch.inverse(calibration.rt[:3, :3]) for calibration in calibrations]
@@ -189,20 +188,27 @@ class Stitcher:
         masks = torch.nn.functional.conv2d(masks, conv_kernel)
         self.calibration_vectors = torch.cat(self.calibration_vectors_list, dim=0).contiguous()
         self.translations = torch.cat(self.translations_list, dim=0).contiguous()
+
         create_blending_luts_cuda(
             block=(self.block_size,),
             grid=(self.panorama_grid_size,),
             args=(self.blending_sampling.data_ptr(), 
             self.blending_weights.data_ptr(),
             masks.data_ptr(),
+            max_min_dist.data_ptr(),
             self.calibration_vectors.data_ptr(),
             rotations.data_ptr(),
             self.translations.data_ptr()))
-
+        
         # Smooth to avoid strong seems
         self.blending_weights = torch.nn.functional.conv2d(self.blending_weights.unsqueeze(1), 
                                                            conv_kernel, padding=smoothing_radius)
-        self.blending_weights /= torch.sum(self.blending_weights, dim=0, keepdim=True)
+        self.blending_weights /= (torch.sum(self.blending_weights, dim=0, keepdim=True) + 1e-8)
+
+        # # create debug variables for visualization in image viewer
+        # for i in range(self.blending_sampling.shape[0]):
+        #     globals()[f'blending_sampling_vis{i}'] = self.blending_sampling[i].cpu().numpy()
+        #     globals()[f'blending_weigths_vis{i}'] = self.blending_weights[i].cpu().numpy()
 
     def stitch(self, images, distance_maps):
         """
@@ -219,7 +225,7 @@ class Stitcher:
         for calibration_vector, translation, image, distance_map, distance_stack, \
                     reprojected_distance, image_to_stitch, inpainting_weight \
                 in zip(self.calibration_vectors_list, self.translations_list, images, distance_maps, self.distances_list,
-                    self.reprojected_distances_list, self.images_to_stitch_list, self.inpainting_weights_list):
+                    self.reprojected_distances_list, self.images_to_stitch_list, self.inpainting_weights_list, strict=True):
 
             # Reproject the distance map to a reference view point
             reprojected_distance.fill_(1e8)
@@ -239,10 +245,10 @@ class Stitcher:
                     grid=(self.fisheye_grid_size,),
                     args=(reprojected_distance.data_ptr(), 
                           inpainting_weight.data_ptr()))
-                
+
             image_to_stitch.copy_(image)
             distance_stack.copy_(distance_map)
-
+            
         self.merge_rgbd_panorama_cuda(
             block=(self.block_size,),
             grid=(self.panorama_grid_size,),
