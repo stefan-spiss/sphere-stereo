@@ -89,7 +89,7 @@ class Stitcher:
         elif cam_model == "kb_fisheye":
             with open('python/kb_fisheye.cuh') as f:
                 cuda_source = utils_source + f.read()
-            with open('python/stitcher_cv.cu') as f:
+            with open('python/stitcher_kb.cu') as f:
                 cuda_source += f.read()
                 cuda_source = cuda_source.replace("MAX_ITER", str(calibrations[0].unproj_crit[0]))
                 cuda_source = cuda_source.replace("UNPROJ_CRIT_0", str(calibrations[0].unproj_crit[1]))
