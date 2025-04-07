@@ -94,7 +94,6 @@ class RGBD_Estimator:
         
     def estimate_min_distance_per_cam(self, masks: list[torch.Tensor], num_search_steps: int = 100) -> list[torch.Tensor]:
         min_distances_per_reference = []
-        print(logging.getLevelName(logger.getEffectiveLevel()))
 
         for reference_index in self.references_indices:
             LOG_INFO(f'ref-cam-{reference_index}: find minimum distance per pixel for matching with other cameras')

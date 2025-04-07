@@ -518,6 +518,7 @@ def parse_json_calib_kb_fisheye(file_path, matching_resolution, use_perspective_
     ):
         original_resolution = torch.tensor(image_size)
         rt = torch.tensor(pose, device=device, dtype=torch.float32)
+        # rt[:3, 3] *= 0.001 # mm to meter
         cam_models.append(
             KBFisheyeModel(
                 original_resolution,
@@ -571,6 +572,9 @@ def read_input_images(filename, dataset_path, matching_resolution, rgb_to_stitch
         
         # Type and innapropriate file handling
         if image is not None:
+            if image.shape == (cam_model.original_resolution[1], cam_model.original_resolution[0], 4):
+                # Read as RGBA
+                image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
             if image.shape == (cam_model.original_resolution[1], cam_model.original_resolution[0], 3):
                 # Map all types range to [0, 255] as float32
                 if image.dtype == np.uint8:

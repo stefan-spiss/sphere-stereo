@@ -39,7 +39,12 @@ import numpy as np
 import torch
 from depth_estimation import RGBD_Estimator
 from joblib import Parallel, delayed
-from log_utils import LOG_ERROR, __default_log_level, initLogging, setDefaultLoggerLevel
+from log_utils import (
+    LOG_DEBUG,
+    LOG_ERROR,
+    LOG_INFO,
+    initLogging,
+)
 from utils import (
     evaluate_rgbd_panorama,
     parse_json_calib,
@@ -70,6 +75,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_perspective_reproj', action=argparse.BooleanOptionalAction, default=False, help="If kb_fisheye is used, use perspective reprojection in addition to Kannala-Brandt reprojection (as done in OpenCV fisheye model).")
     parser.add_argument('--recalculate_fov', action=argparse.BooleanOptionalAction, default=True, help="If kb_fisheye is used, recalculate the field of view (FOV) for the fisheye camera model.")
     parser.add_argument('--max_theta', type=float, default=90, help="If kb_fisheye is used, maximum theta value for the fisheye camera model (in degrees).")
+    parser.add_argument('--load_all_frames_parallel', action=argparse.BooleanOptionalAction, default=False, help="Process all images in parallel (for large datasets, this requires a lot of memory).")
     args = parser.parse_args()
     
     initLogging()
@@ -105,7 +111,7 @@ if __name__ == "__main__":
             mask = cv2.resize(mask, tuple(args.matching_resolution), cv2.INTER_AREA)
             masks.append(torch.tensor(mask, device=args.device, dtype=torch.float32).unsqueeze(0)/255)
         else:
-            masks.append(torch.ones(args.matching_resolution, device=args.device).unsqueeze(0))
+            masks.append(torch.ones(args.matching_resolution, device=args.device).T.unsqueeze(0))
 
     # Initialize distance estimator and stitcher
     rgbd_estimator = RGBD_Estimator(cam_models, args.min_dist, args.max_dist, args.candidate_count, args.search_steps_min_dist,
@@ -115,76 +121,165 @@ if __name__ == "__main__":
 
 
     filenames = os.listdir(os.path.join(args.dataset_path, "cam0/"))
+    LOG_DEBUG("Found %d images in the dataset.", len(filenames))
 
     with suppress(ValueError): # mask is not mandatory
         filenames.remove("mask.png")
 
-    all_fisheye_images = Parallel(n_jobs=-1, backend="threading")(
-        delayed(read_input_images)(
-            filename, args.dataset_path, args.matching_resolution, args.rgb_to_stitch_resolution, 
-            cam_models, args.references_indices) 
-        for filename in filenames)
-
-    rgbd_panoramas = {}
-    for frame_index, filename in enumerate(filenames):
-        fisheye_images = all_fisheye_images[frame_index]["images_to_match"]
-        reference_fisheye_images = all_fisheye_images[frame_index]["images_to_stitch"]
-        valid_frame = all_fisheye_images[frame_index]["is_valid"]
-
-        if valid_frame:
-            fisheye_images = [torch.tensor(fisheye_image, device=args.device) for fisheye_image in fisheye_images]
-            reference_fisheye_images = [torch.tensor(reference_fisheye_image, device=args.device) 
-                                        for reference_fisheye_image in reference_fisheye_images]
-            rgb, distance = rgbd_estimator.estimate_RGBD_panorama(fisheye_images, reference_fisheye_images)
-            
-            rgbd_panoramas[filename] = {"rgb": rgb.cpu().numpy(), "inv_distance": 1 / distance.cpu().numpy()}
-
-            if args.visualize:
-                # Map inverse distance to [0, 255] and display
-                distance_map = 1 / distance.cpu().numpy()
-                distance_map = ((rgbd_panoramas[filename]["inv_distance"] - 1 / args.max_dist) 
-                                / (1 / args.min_dist - 1 / args.max_dist))
-                distance_map = np.clip(255 * distance_map, 0, 255).astype(np.uint8)
-                distance_map = cv2.applyColorMap(distance_map, cv2.COLORMAP_MAGMA)
-                cv2.imshow("distance_map", distance_map)
-                cv2.imshow("rgb", rgbd_panoramas[filename]["rgb"])
-                cv2.waitKey()
-
-    if args.saving:
-        Path(os.path.join(args.dataset_path, "output")).mkdir(parents=True, exist_ok=True)
-        Parallel(n_jobs=-1, backend="threading")(
-            delayed(save_rgbd_panorama)(rgbd_panoramas, filename, args.dataset_path) 
+        # process all images in parallel (for large datasets, this requires a lot of memory)
+    if args.load_all_frames_parallel:
+        LOG_INFO("Loading all frames into memory in parallel.")
+        all_fisheye_images = Parallel(n_jobs=-1, backend="threading")(
+            delayed(read_input_images)(
+                filename, args.dataset_path, args.matching_resolution, args.rgb_to_stitch_resolution, 
+                cam_models, args.references_indices) 
             for filename in filenames)
 
+        rgbd_panoramas = {}
+        for frame_index, filename in enumerate(filenames):
+            LOG_INFO(f"Processing frame {frame_index}: {filename}")
+            fisheye_images = all_fisheye_images[frame_index]["images_to_match"]
+            reference_fisheye_images = all_fisheye_images[frame_index]["images_to_stitch"]
+            valid_frame = all_fisheye_images[frame_index]["is_valid"]
 
-    if args.evaluate:
-        evaluations = Parallel(n_jobs=-1, backend="threading")(
-            delayed(evaluate_rgbd_panorama)(rgbd_panoramas, filename, args.dataset_path, 
-                                            args.bad_px_ratio_thresholds, args.panorama_resolution) 
-            for filename in filenames)
+            if valid_frame:
+                fisheye_images = [torch.tensor(fisheye_image, device=args.device) for fisheye_image in fisheye_images]
+                reference_fisheye_images = [torch.tensor(reference_fisheye_image, device=args.device) 
+                                            for reference_fisheye_image in reference_fisheye_images]
+                rgb, distance = rgbd_estimator.estimate_RGBD_panorama(fisheye_images, reference_fisheye_images)
+                
+                rgbd_panoramas[filename] = {"rgb": rgb.cpu().numpy(), "inv_distance": 1 / distance.cpu().numpy()}
 
-        # Average the evaluation metrics
-        psnr = 0
-        ssim = 0
-        rmse = 0
-        mae = 0
-        bad_px_ratios = [0] * len(args.bad_px_ratio_thresholds)
-        evaluation_count = 0
+                if args.visualize:
+                    # Map inverse distance to [0, 255] and display
+                    distance_map = 1 / distance.cpu().numpy()
+                    distance_map = ((rgbd_panoramas[filename]["inv_distance"] - 1 / args.max_dist) 
+                                    / (1 / args.min_dist - 1 / args.max_dist))
+                    distance_map = np.clip(255 * distance_map, 0, 255).astype(np.uint8)
+                    distance_map = cv2.applyColorMap(distance_map, cv2.COLORMAP_MAGMA)
+                    cv2.imshow("distance_map", distance_map)
+                    cv2.imshow("rgb", rgbd_panoramas[filename]["rgb"])
+                    key = cv2.waitKey(0)
+                    
+                    if key == 27:  # ESC key
+                        break
 
-        for evaluation in evaluations:
-            if evaluation is not None:
-                psnr += evaluation["psnr"]
-                ssim += evaluation["ssim"]
-                rmse += evaluation["rmse"]
-                mae += evaluation["mae"]
-                bad_px_ratios = [bad_px_ratio + current_bad_px_ratio 
-                    for  bad_px_ratio, current_bad_px_ratio in zip(bad_px_ratios, evaluation["bad_px_ratios"], strict=True)]
-                evaluation_count += 1
+        if args.saving:
+            LOG_INFO("Saving all resulting panoramas in parallel.")
+            Path(os.path.join(args.dataset_path, "output")).mkdir(parents=True, exist_ok=True)
+            Parallel(n_jobs=-1, backend="threading")(
+                delayed(save_rgbd_panorama)(rgbd_panoramas, filename, args.dataset_path) 
+                for filename in filenames)
 
-        if evaluation_count > 0:
-            print("PSNR = ", psnr / evaluation_count)
-            print("SSIM = ", ssim / evaluation_count)
-            for bad_px_ratio, bad_px_ratio_threshold in zip(bad_px_ratios, args.bad_px_ratio_thresholds, strict=True):
-                print(">", bad_px_ratio_threshold, " = ", bad_px_ratio / evaluation_count)
-            print("MAE = ", mae / evaluation_count)
-            print("RMSE = ", rmse / evaluation_count)
+
+        if args.evaluate:
+            LOG_INFO("Evaluation of all resulting panoramas in parallel.")
+            evaluations = Parallel(n_jobs=-1, backend="threading")(
+                delayed(evaluate_rgbd_panorama)(rgbd_panoramas, filename, args.dataset_path, 
+                                                args.bad_px_ratio_thresholds, args.panorama_resolution) 
+                for filename in filenames)
+
+            # Average the evaluation metrics
+            psnr = 0
+            ssim = 0
+            rmse = 0
+            mae = 0
+            bad_px_ratios = [0] * len(args.bad_px_ratio_thresholds)
+            evaluation_count = 0
+
+            for evaluation in evaluations:
+                if evaluation is not None:
+                    psnr += evaluation["psnr"]
+                    ssim += evaluation["ssim"]
+                    rmse += evaluation["rmse"]
+                    mae += evaluation["mae"]
+                    bad_px_ratios = [bad_px_ratio + current_bad_px_ratio 
+                        for  bad_px_ratio, current_bad_px_ratio in zip(bad_px_ratios, evaluation["bad_px_ratios"], strict=True)]
+                    evaluation_count += 1
+
+            if evaluation_count > 0:
+                LOG_INFO("PSNR = ", psnr / evaluation_count)
+                LOG_INFO("SSIM = ", ssim / evaluation_count)
+                for bad_px_ratio, bad_px_ratio_threshold in zip(bad_px_ratios, args.bad_px_ratio_thresholds, strict=True):
+                    LOG_INFO(">", bad_px_ratio_threshold, " = ", bad_px_ratio / evaluation_count)
+                LOG_INFO("MAE = ", mae / evaluation_count)
+                LOG_INFO("RMSE = ", rmse / evaluation_count)
+    else:
+        evaluations = []
+        for frame_index, filename in enumerate(filenames):
+            LOG_INFO(f"Processing frame {frame_index}: {filename}")
+            input_imgs = read_input_images(
+                filename,
+                args.dataset_path,
+                args.matching_resolution,
+                args.rgb_to_stitch_resolution,
+                cam_models,
+                args.references_indices,
+            )
+            fisheye_images = input_imgs["images_to_match"]
+            reference_fisheye_images = input_imgs["images_to_stitch"]
+            valid_frame = input_imgs["is_valid"]
+                    
+            if valid_frame:
+                fisheye_images = [torch.tensor(fisheye_image, device=args.device) for fisheye_image in fisheye_images]
+                reference_fisheye_images = [torch.tensor(reference_fisheye_image, device=args.device) 
+                                            for reference_fisheye_image in reference_fisheye_images]
+                rgb, distance = rgbd_estimator.estimate_RGBD_panorama(fisheye_images, reference_fisheye_images)
+                
+                rgbd_panorama = {}
+                rgbd_panorama[filename] = {"rgb": rgb.cpu().numpy(), "inv_distance": 1 / distance.cpu().numpy()}
+
+                if args.visualize:
+                    # Map inverse distance to [0, 255] and display
+                    distance_map = 1 / distance.cpu().numpy()
+                    distance_map = ((rgbd_panorama[filename]["inv_distance"] - 1 / args.max_dist) 
+                                    / (1 / args.min_dist - 1 / args.max_dist))
+                    distance_map = np.clip(255 * distance_map, 0, 255).astype(np.uint8)
+                    distance_map = cv2.applyColorMap(distance_map, cv2.COLORMAP_MAGMA)
+                    cv2.imshow("distance_map", distance_map)
+                    cv2.imshow("rgb", rgbd_panorama[filename]["rgb"])
+                    key = cv2.waitKey(0)
+                    
+                    if key == 27:  # ESC key
+                        break
+                if args.saving:
+                    LOG_INFO("Saving the resulting panorama.")
+                    Path(os.path.join(args.dataset_path, "output")).mkdir(parents=True, exist_ok=True)
+                    save_rgbd_panorama(rgbd_panorama, filename, args.dataset_path)
+                if args.evaluate:
+                    LOG_INFO("Evaluation of the resulting panorama.")
+                    evaluations.append(
+                        evaluate_rgbd_panorama(
+                            rgbd_panorama, filename, args.dataset_path, 
+                            args.bad_px_ratio_thresholds, args.panorama_resolution
+                        )
+                    )
+                    LOG_INFO("Evaluation result:\n\tPSNR = {evaluation['psnr']}\n\tSSIM = {evaluation['ssim']}\n\tMAE = {evaluation['mae']}\n\tRMSE = {evaluation['rmse']}")
+                
+        if args.evaluate:
+            LOG_INFO("Calculating average evaluation metrics.")
+            # Average the evaluation metrics
+            psnr = 0
+            ssim = 0
+            rmse = 0
+            mae = 0
+            bad_px_ratios = [0] * len(args.bad_px_ratio_thresholds)
+            evaluation_count = 0
+
+            for evaluation in evaluations:
+                if evaluation is not None:
+                    psnr += evaluation["psnr"]
+                    ssim += evaluation["ssim"]
+                    rmse += evaluation["rmse"]
+                    mae += evaluation["mae"]
+                    bad_px_ratios = [bad_px_ratio + current_bad_px_ratio 
+                        for  bad_px_ratio, current_bad_px_ratio in zip(bad_px_ratios, evaluation["bad_px_ratios"], strict=True)]
+                    evaluation_count += 1
+
+            if evaluation_count > 0:
+                LOG_INFO("PSNR = ", psnr / evaluation_count)
+                LOG_INFO("SSIM = ", ssim / evaluation_count)
+                for bad_px_ratio, bad_px_ratio_threshold in zip(bad_px_ratios, args.bad_px_ratio_thresholds, strict=True):
+                    LOG_INFO(">", bad_px_ratio_threshold, " = ", bad_px_ratio / evaluation_count)
+                LOG_INFO("MAE = ", mae / evaluation_count)
+                LOG_INFO("RMSE = ", rmse / evaluation_count)
