@@ -183,6 +183,21 @@ class KBFisheyeModel(CamModel):
         )
 
     def unproject(self, uv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Unprojects 2D image coordinates to 3D unit sphere coordinates using the Kannala-Brandt camera model. There are two different ways of unprojection to the unit sphere:
+            - A perspective projection with a focal distance of 1 is used to project points on the unit sphere (see fisheye model of OpenCV). (Selected if self.use_perspective_reproj is True)
+            - The Kannala-Brandt model is used to unproject points on the unit sphere (see basalt-headers: https://github.com/VladyslavUsenko/basalt-headers)
+        Independent of the method, for the generation of the validity mask, flipping of theta and the convergence rate of the solver (if not smaller as self.unproj_crit[2] pixel invalid) is considered.
+        In addition, all thetas > self.max_theta are also set to invalid in the validity mask.
+
+        Args:
+            uv (torch.Tensor): A tensor of shape (N, 2) representing 2D image coordinates.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: 
+                - points (torch.Tensor): A tensor of shape (N, 3) representing the 3D points in space.
+                - valid (torch.Tensor): A boolean tensor of shape (N) indicating whether each point is valid.
+        """
         points, valid, theta = self.__unproject(uv)
         valid = torch.logical_and(valid.unsqueeze(-1), theta <= self.max_theta)
         # points[~valid[..., 0]] = torch.tensor([torch.nan, torch.nan, torch.nan], device=uv.device)
@@ -190,13 +205,17 @@ class KBFisheyeModel(CamModel):
     
     def project(self, point: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Projects a 3D point onto a 2D plane using fisheye distortion parameters.
+        Projects a 3D points onto a 2D plane using the Kannala-Brandt camera model. There are two different ways of projection to the image plane:
+            - A perspective projection with a focal distance of 1 is used to project points on the unit sphere (see fisheye model of OpenCV). (Selected if self.use_perspective_reproj is True)
+            - The Kannala-Brandt model is used to unproject points on the unit sphere (see basalt-headers: https://github.com/VladyslavUsenko/basalt-headers)
+        The validity mask is set to invalid, for all points with radius r = sqrt(x^2 + y^2) < self.proj_crit or abs(z) < self.proj_crit and for all points with theta > self.max_theta.
         Args:
-            point (torch.Tensor): A tensor of shape (..., 3) representing the 3D points to be projected.
+            point (torch.Tensor): A tensor of shape (N, 3) representing 3D points in space. The last dimension contains the (x, y, z) coordinates.
         Returns:
-            tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-                - uv (torch.Tensor): A tensor of shape (..., 2) representing the 2D projected points.
-                - valid (torch.Tensor): A boolean tensor of shape (...) indicating whether each point is within the valid range.
+            tuple:
+                - uv (torch.Tensor): A tensor of shape (N, 2) containing the projected 2D coordinates.
+                - valid (torch.Tensor): A boolean tensor of shape (N) indicating valid projection points.
+                - theta (torch.Tensor): A tensor of shape (N) containing the angle theta for each point.
         """
         uv, valid, theta = self.__project(point)
         valid = torch.logical_and(valid.unsqueeze(-1), theta <= self.max_theta)
@@ -280,13 +299,11 @@ class KBFisheyeModel(CamModel):
     def __unproject(self, uv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Unprojects 2D image coordinates to 3D unit sphere coordinates using the Kannala-Brandt camera model. There are two different ways of unprojection to the unit sphere:
-            - A perspective projection with a focal distance of 1 is used to project points on the unit sphere (see fisheye model of OpenCV).
+            - A perspective projection with a focal distance of 1 is used to project points on the unit sphere (see fisheye model of OpenCV). (Selected if self.use_perspective_reproj is True)
             - The Kannala-Brandt model is used to unproject points on the unit sphere (see basalt-headers: https://github.com/VladyslavUsenko/basalt-headers)
         Independent of the method, for the generation of the validity mask, flipping of theta and the convergence rate of the solver (if not smaller as self.unproj_crit[2] pixel invalid) is considered.
         Args:
-            uv (torch.Tensor | NDArray): 2D image coordinates as a tensor or numpy array with shape (N, 2).
-            use_perspective_reproj (bool, optional): Whether to use perspective reprojection. Defaults to True.
-            solver_params (tuple[int, float], optional): A tuple containing the maximum number of iterations and the convergence threshold for the solver. Default is (10, 1e-8).
+            uv (torch.Tensor): 2D image coordinates as a tensor or numpy array with shape (N, 2).
         Returns:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             - points (torch.Tensor): 3D coordinates on the unit sphere with shape (N, 3).
@@ -332,6 +349,19 @@ class KBFisheyeModel(CamModel):
 
 
     def __project(self, point: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Projects a 3D points onto a 2D plane using the Kannala-Brandt camera model. There are two different ways of projection to the image plane:
+            - A perspective projection with a focal distance of 1 is used to project points on the unit sphere (see fisheye model of OpenCV). (Selected if self.use_perspective_reproj is True)
+            - The Kannala-Brandt model is used to unproject points on the unit sphere (see basalt-headers: https://github.com/VladyslavUsenko/basalt-headers)
+        The validity mask is set to invalid, for all points with radius r = sqrt(x^2 + y^2) < self.proj_crit or abs(z) < self.proj_crit.
+        Args:
+            point (torch.Tensor): A tensor of shape (N, 3) representing 3D points in space. The last dimension contains the (x, y, z) coordinates.
+        Returns:
+            tuple:
+                - uv (torch.Tensor): A tensor of shape (N, 2) containing the projected 2D coordinates.
+                - valid (torch.Tensor): A boolean tensor of shape (N) indicating valid projection points.
+                - theta (torch.Tensor): A tensor of shape (N) containing the angle theta for each point.
+        """
         # OpenCV uses a perspective reprojection with I (identity) as camera matrix to obtain the normalized undistorted image coordinates
         if  self.use_perspective_reproj:
             # To avoid the mirroring along the center of the image, the absolute value of z is used (z can be positive or negative)
@@ -389,7 +419,15 @@ class KBFisheyeModel(CamModel):
         return uv, valid[..., 0], theta
 
 
-    def __calculateFoV(self):
+    def __calculateFoV(self) -> torch.Tensor:
+        """
+        Calculates the maximum field of view (FoV) for the fisheye camera in both horizontal and vertical directions.
+        For this, 4 points (at the center of the image along one axis and at one border of the image along the other axis) are unprojected to a unit sphere.
+        If the resulting 3D points are valid, they are used to calculate the horizontal and the vertical FoV.
+        Otherwise, the FOV is set to maximum theta (self.max_theta).
+        Returns:
+            torch.Tensor: A tensor containing the horizontal and vertical FoV in radians.
+        """
         xc = self.principal[0] * self.matching_scale[0]
         yc = self.principal[1] * self.matching_scale[1]
         width = self.original_resolution[0] * self.matching_scale[0]
