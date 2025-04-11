@@ -212,7 +212,8 @@ struct FisheyeKBPerspectiveProjection {
             point = point / length(point);
         }
 #else
-        float3 point = make_float3(pw.x * scale, pw.y * scale, 1.0f);
+        // float3 point = make_float3(pw.x * scale, pw.y * scale, 1.0f);
+        float3 point = make_float3(pw.x * scale, pw.y * scale, cosf(theta));
         point = point / length(point);
 #endif
 

@@ -333,11 +333,13 @@ class KBFisheyeModel(CamModel):
 
         m_xy = m_xy * scale
 
-        if self.use_perspective_reproj:
-            # assume z = 1 (focal length = 1) and reproject to unit sphere
-            m_z = torch.ones_like(m_xy[..., 0]).unsqueeze(-1)
-        else:
-            m_z = torch.cos(theta)
+        # if self.use_perspective_reproj:
+        #     # assume z = 1 (focal length = 1) and reproject to unit sphere
+        #     m_z = torch.ones_like(m_xy[..., 0]).unsqueeze(-1)
+        # else:
+        #     m_z = torch.cos(theta)
+
+        m_z = torch.cos(theta)
         
         points = torch.cat([m_xy, m_z], dim=-1)
         points = points / torch.sqrt(torch.sum(points**2, dim=-1, keepdim=True))
